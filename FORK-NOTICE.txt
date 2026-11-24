@@ -1,9 +1,0 @@
-Sunviz is an unofficial fork / modification of the original FLP In Video (FLP to Video) script.
-The original FLP parsing and VEGAS placement logic is retained and modified.
-Sunviz is not affiliated with Image-Line or MAGIX.
-
-
-Sunviz modifications in this update: ZIP extraction no longer uses System.IO.Compression.FileSystem; ZIP entries are extracted with ZipArchive and path traversal checks. Added a three-language selector (English/Russian/Spanish) for primary controls and the supplied Sunviz icon.
-
-
-Sunviz v1.3 update: branded the main window as Sunviz; added Light, Dark, Sunset and Sunrise palettes; expanded English/Russian/Spanish UI translations and persisted theme selection.
