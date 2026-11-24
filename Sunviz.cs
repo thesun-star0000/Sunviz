@@ -1,6 +1,6 @@
-/*
- * FLP to Video  v1.0
- * FL Studio project -> video placement for VEGAS Pro 16 and newer.
+﻿/*
+ * Sunviz  v1.2
+ * Sunviz: FL Studio project -> video placement for VEGAS Pro 16 and newer.
  *
  * The FL Studio sibling of MIDI to Video: instead of a MIDI export it reads the .flp itself
  * (through flp2json.exe, built on PyFLP), so it knows what MIDI loses:
@@ -16,10 +16,10 @@
  * USE
  *   1. Click the clip to place on the timeline (or select a file in Project Media).
  *      For chopped audio clips, select the same event you rendered the sample from.
- *   2. Tools > Scripting > FLP to Video, then pick the .flp.
+ *   2. Tools > Scripting > Sunviz, then pick the .flp.
  *   3. Tick channels, set timing and effects, press Generate. One Ctrl+Z undoes the whole run.
  *
- * Settings and effect presets are kept in %APPDATA%\FLP to Video\.
+ * Settings and effect presets are kept in %APPDATA%\Sunviz\.
  */
 
 using System;
@@ -57,12 +57,13 @@ namespace FlpToVideo
         static void Run(Vegas vegas)
         {
             Settings st = Settings.Load();
+            Theme.Set(st.ThemeName);
 
             SourceClip source = SourceClip.Find(vegas);   // the clip selected on the timeline, if any
             Subclips subclips = Subclips.Scan(vegas);
             if (source == null && subclips.Count == 0)
                 throw new UserError("Select the clip to place first.\n\nClick a video clip on the timeline, or name " +
-                    "Project Media subclips after your FL channels or samples, then run FLP to Video again.");
+                    "Project Media subclips after your FL channels or samples, then run Sunviz again.");
 
             // Reopen the last project (re-read, so FL edits since last time come along); ask only when there's none.
             IWin32Window owner = Native.VegasWindow();
@@ -101,7 +102,7 @@ namespace FlpToVideo
         static Image Snapshot(Vegas vegas, SourceClip src)
         {
             if (src == null || src.Event == null) return null;
-            string path = Path.Combine(Path.GetTempPath(), "flp2vid_frame_" + Guid.NewGuid().ToString("N") + ".png");
+            string path = Path.Combine(Path.GetTempPath(), "sunviz_frame_" + Guid.NewGuid().ToString("N") + ".png");
             try
             {
                 Timecode at = src.Event.Start + Timecode.FromMilliseconds(Math.Min(src.LengthMs / 2, 250));
@@ -122,14 +123,14 @@ namespace FlpToVideo
 
     internal static class Ui
     {
-        public const string App = "FLP to Video";
+        public const string App = "Sunviz";
 
         public static string PickFlp(IWin32Window owner, string last)
         {
             using (OpenFileDialog d = new OpenFileDialog())
             {
-                d.Title = "Open FL Studio project";
-                d.Filter = "FL Studio projects (*.flp)|*.flp|All files (*.*)|*.*";
+                d.Title = "Open FL Studio project or ZIP archive";
+                d.Filter = "FL Studio project or ZIP (*.flp;*.zip)|*.flp;*.zip|FL Studio projects (*.flp)|*.flp|ZIP archives (*.zip)|*.zip|All files (*.*)|*.*";
                 try
                 {
                     if (!string.IsNullOrEmpty(last))
@@ -141,6 +142,33 @@ namespace FlpToVideo
                 }
                 catch { }
                 return d.ShowDialog(owner) == DialogResult.OK ? d.FileName : null;
+            }
+        }
+
+        public static string ChooseProject(IWin32Window owner, string[] projects)
+        {
+            if (projects == null || projects.Length == 0) return null;
+            if (projects.Length == 1) return projects[0];
+            using (Form f = new Form())
+            using (ListBox list = new ListBox())
+            using (Button ok = new Button())
+            using (Button cancel = new Button())
+            {
+                f.Text = "Sunviz — Select FLP";
+                f.StartPosition = FormStartPosition.CenterParent;
+                f.FormBorderStyle = FormBorderStyle.FixedDialog;
+                f.MinimizeBox = false; f.MaximizeBox = false;
+                f.ShowInTaskbar = false; f.ClientSize = new Size(520, 300);
+                list.Dock = DockStyle.Top; list.Height = 245;
+                foreach (string p in projects) list.Items.Add(p);
+                list.SelectedIndex = 0;
+                ok.Text = "Open"; ok.DialogResult = DialogResult.OK;
+                cancel.Text = "Cancel"; cancel.DialogResult = DialogResult.Cancel;
+                ok.SetBounds(330, 260, 80, 28); cancel.SetBounds(420, 260, 90, 28);
+                f.Controls.Add(list); f.Controls.Add(ok); f.Controls.Add(cancel);
+                f.AcceptButton = ok; f.CancelButton = cancel;
+                return f.ShowDialog(owner) == DialogResult.OK && list.SelectedIndex >= 0
+                    ? projects[list.SelectedIndex] : null;
             }
         }
 
@@ -190,6 +218,7 @@ namespace FlpToVideo
         public readonly List<EffectSpec> Effects = new List<EffectSpec>();
         public SourceClip Default;        // the clip selected on the timeline (may be null)
         public readonly Dictionary<Part, SourceClip> Sources = new Dictionary<Part, SourceClip>(); // subclip matches
+        public TrackMotionSpec TrackMotion = new TrackMotionSpec();
 
         public EffectSpec Get(Fx type)
         {
@@ -201,6 +230,253 @@ namespace FlpToVideo
         {
             SourceClip s;
             return Sources.TryGetValue(part, out s) ? s : Default;
+        }
+    }
+
+    /// <summary>2D Track Motion pose applied to each generated video track (VEGAS TrackMotion API).</summary>
+    internal sealed class TrackMotionSpec
+    {
+        public bool Enabled;
+        public double X, Y;           // position (media center relative to frame center is handled by Width/Height)
+        public double Width = 1920, Height = 1080;
+        public double Angle;          // orientation Z degrees
+        public double RotZ;           // rotation Z degrees
+        public double RotOffX, RotOffY;
+        public bool Shadow;
+        public double ShadowX = 8, ShadowY = -8, ShadowBlur = 12, ShadowAlpha = 50;
+        public double ShadowWidth = 1920, ShadowHeight = 1080;
+        public bool RotationEnabled = true;
+        public int GridCols = 1, GridRows = 1; // layout grid N×M (1×1 = full frame)
+        public string Preset = "Full frame";
+
+        public TrackMotionSpec Clone()
+        {
+            return (TrackMotionSpec)MemberwiseClone();
+        }
+
+        public string Serialize()
+        {
+            return string.Join(";", new string[] {
+                Enabled ? "1" : "0",
+                X.ToString(CultureInfo.InvariantCulture),
+                Y.ToString(CultureInfo.InvariantCulture),
+                Width.ToString(CultureInfo.InvariantCulture),
+                Height.ToString(CultureInfo.InvariantCulture),
+                Angle.ToString(CultureInfo.InvariantCulture),
+                RotZ.ToString(CultureInfo.InvariantCulture),
+                RotOffX.ToString(CultureInfo.InvariantCulture),
+                RotOffY.ToString(CultureInfo.InvariantCulture),
+                Shadow ? "1" : "0",
+                ShadowX.ToString(CultureInfo.InvariantCulture),
+                ShadowY.ToString(CultureInfo.InvariantCulture),
+                ShadowBlur.ToString(CultureInfo.InvariantCulture),
+                ShadowAlpha.ToString(CultureInfo.InvariantCulture),
+                Preset ?? "",
+                GridCols.ToString(CultureInfo.InvariantCulture),
+                GridRows.ToString(CultureInfo.InvariantCulture),
+                ShadowWidth.ToString(CultureInfo.InvariantCulture),
+                ShadowHeight.ToString(CultureInfo.InvariantCulture),
+                RotationEnabled ? "1" : "0"
+            });
+        }
+
+        public static TrackMotionSpec Parse(string s)
+        {
+            TrackMotionSpec t = new TrackMotionSpec();
+            if (string.IsNullOrEmpty(s)) return t;
+            string[] p = s.Split(';');
+            try
+            {
+                if (p.Length > 0) t.Enabled = p[0] == "1";
+                if (p.Length > 1) t.X = double.Parse(p[1], CultureInfo.InvariantCulture);
+                if (p.Length > 2) t.Y = double.Parse(p[2], CultureInfo.InvariantCulture);
+                if (p.Length > 3) t.Width = double.Parse(p[3], CultureInfo.InvariantCulture);
+                if (p.Length > 4) t.Height = double.Parse(p[4], CultureInfo.InvariantCulture);
+                if (p.Length > 5) t.Angle = double.Parse(p[5], CultureInfo.InvariantCulture);
+                if (p.Length > 6) t.RotZ = double.Parse(p[6], CultureInfo.InvariantCulture);
+                if (p.Length > 7) t.RotOffX = double.Parse(p[7], CultureInfo.InvariantCulture);
+                if (p.Length > 8) t.RotOffY = double.Parse(p[8], CultureInfo.InvariantCulture);
+                if (p.Length > 9) t.Shadow = p[9] == "1";
+                if (p.Length > 10) t.ShadowX = double.Parse(p[10], CultureInfo.InvariantCulture);
+                if (p.Length > 11) t.ShadowY = double.Parse(p[11], CultureInfo.InvariantCulture);
+                if (p.Length > 12) t.ShadowBlur = double.Parse(p[12], CultureInfo.InvariantCulture);
+                if (p.Length > 13) t.ShadowAlpha = double.Parse(p[13], CultureInfo.InvariantCulture);
+                if (p.Length > 14) t.Preset = p[14];
+                if (p.Length > 15) int.TryParse(p[15], out t.GridCols);
+                if (p.Length > 16) int.TryParse(p[16], out t.GridRows);
+                if (p.Length > 17) t.ShadowWidth = double.Parse(p[17], CultureInfo.InvariantCulture);
+                if (p.Length > 18) t.ShadowHeight = double.Parse(p[18], CultureInfo.InvariantCulture);
+                if (p.Length > 19) t.RotationEnabled = p[19] == "1";
+                if (t.GridCols < 1) t.GridCols = 1;
+                if (t.GridRows < 1) t.GridRows = 1;
+            }
+            catch { }
+            return t;
+        }
+
+        public void ApplyTo(VideoTrack track, int frameW, int frameH)
+        {
+            Shadow = false; // 2D Shadow is intentionally disabled in Sunviz Track Motion.
+            if (track == null || !Enabled) return;
+            try
+            {
+                TrackMotion tm = track.TrackMotion;
+                if (tm == null) return;
+                TrackMotionKeyframe kf = null;
+                if (tm.MotionKeyframes != null && tm.MotionKeyframes.Count > 0)
+                    kf = tm.MotionKeyframes[0];
+                else
+                    kf = tm.InsertMotionKeyframe(Timecode.FromMilliseconds(0));
+                if (kf == null) return;
+
+                double w = Width > 1 ? Width : frameW;
+                double h = Height > 1 ? Height : frameH;
+                kf.Width = w;
+                kf.Height = h;
+                kf.PositionX = X;
+                kf.PositionY = Y;
+                try { kf.OrientationZ = RotationEnabled ? Angle : 0; } catch { }
+                try { kf.RotationZ = RotationEnabled ? RotZ : 0; } catch { }
+                try { kf.RotationOffsetX = RotationEnabled ? RotOffX : 0; } catch { }
+                try { kf.RotationOffsetY = RotationEnabled ? RotOffY : 0; } catch { }
+
+            }
+            catch { /* Track Motion not available on this track / host */ }
+        }
+
+        /// <summary>Add Drop Shadow OFX/DirectX on the Video Track chain (once per track).</summary>
+        void TryApplyDropShadowFx(VideoTrack track)
+        {
+            if (track == null) return;
+            try
+            {
+                // Already present?
+                foreach (Effect e in track.Effects)
+                {
+                    try
+                    {
+                        string n = e.PlugIn != null ? e.PlugIn.Name : "";
+                        if (n != null && n.IndexOf("Drop Shadow", StringComparison.OrdinalIgnoreCase) >= 0)
+                            return;
+                        if (n != null && n.IndexOf("Soft Shadow", StringComparison.OrdinalIgnoreCase) >= 0)
+                            return;
+                    }
+                    catch { }
+                }
+
+                PlugInNode plugin = FindDropShadowPlugin();
+                if (plugin == null) return;
+                Effect fx = track.Effects.AddEffect(plugin);
+                if (fx == null) return;
+
+                // Best-effort parameter mapping (names vary by plugin build)
+                try
+                {
+                    if (fx.IsOFX && fx.OFXEffect != null)
+                    {
+                        // common OFX-ish names
+                        SetOfxDouble(fx, new string[] { "Blur", "BlurAmount", "blur", "Softness", "softness" }, ShadowBlur);
+                        SetOfxDouble(fx, new string[] { "Intensity", "Opacity", "Strength", "Amount", "alpha" }, ShadowAlpha / 100.0);
+                        SetOfxDouble(fx, new string[] { "X Offset", "OffsetX", "Distance X", "X", "x" }, ShadowX);
+                        SetOfxDouble(fx, new string[] { "Y Offset", "OffsetY", "Distance Y", "Y", "y" }, ShadowY);
+                        SetOfxDouble(fx, new string[] { "Distance", "distance" }, Math.Sqrt(ShadowX * ShadowX + ShadowY * ShadowY));
+                        SetOfxDouble(fx, new string[] { "Angle", "angle", "Direction" }, Math.Atan2(ShadowY, ShadowX) * 180.0 / Math.PI);
+                    }
+                }
+                catch { }
+            }
+            catch { }
+        }
+
+        static PlugInNode FindDropShadowPlugin()
+        {
+            try
+            {
+                // Prefer names commonly shipped with VEGAS
+                string[] names = {
+                    "Drop Shadow", "Soft Drop Shadow", "Soft Shadow",
+                    "VEGAS Drop Shadow", "MAGIX Drop Shadow", "Sony Drop Shadow",
+                    "S_DropShadow", "S_Drop Shadow", "DropShadow",
+                    "Shadow", "3D Drop Shadow", "Cast Shadow"
+                };
+                foreach (string name in names)
+                {
+                    try
+                    {
+                        PlugInNode n = VegasApp.VideoFX.GetChildByName(name);
+                        if (n != null) return n;
+                    }
+                    catch { }
+                }
+                // Deep search
+                return FindPluginRecursive(VegasApp.VideoFX, "shadow");
+            }
+            catch { return null; }
+        }
+
+        static PlugInNode FindPluginRecursive(PlugInNode root, string needle)
+        {
+            if (root == null) return null;
+            try
+            {
+                if (root.Name != null && root.Name.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0
+                    && root.Name.IndexOf("Drop", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return root;
+            }
+            catch { }
+            try
+            {
+                foreach (PlugInNode child in root)
+                {
+                    PlugInNode f = FindPluginRecursive(child, needle);
+                    if (f != null) return f;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        static void SetOfxDouble(Effect fx, string[] names, double value)
+        {
+            foreach (string name in names)
+            {
+                try
+                {
+                    OFXParameter p = fx.OFXEffect.FindParameterByName(name);
+                    if (p == null) continue;
+                    OFXDoubleParameter d = p as OFXDoubleParameter;
+                    if (d != null) { d.Value = value; return; }
+                }
+                catch { }
+            }
+        }
+
+        // Cached host for plugin lookup during ApplyTo
+        internal static Vegas VegasApp;
+
+        static void TrySet(object o, string prop, double v)
+        {
+            try
+            {
+                System.Reflection.PropertyInfo pi = o.GetType().GetProperty(prop);
+                if (pi == null || !pi.CanWrite) return;
+                if (pi.PropertyType == typeof(float)) pi.SetValue(o, (float)v, null);
+                else if (pi.PropertyType == typeof(double)) pi.SetValue(o, v, null);
+                else if (pi.PropertyType == typeof(int)) pi.SetValue(o, (int)Math.Round(v), null);
+                else pi.SetValue(o, Convert.ChangeType(v, pi.PropertyType), null);
+            }
+            catch { }
+        }
+
+        static void TrySetBool(object o, string prop, bool v)
+        {
+            try
+            {
+                System.Reflection.PropertyInfo pi = o.GetType().GetProperty(prop);
+                if (pi != null && pi.CanWrite && pi.PropertyType == typeof(bool))
+                    pi.SetValue(o, v, null);
+            }
+            catch { }
         }
     }
 
@@ -555,10 +831,27 @@ namespace FlpToVideo
             if (exe == null)
                 throw new UserError("flp2json.exe wasn't found.\n\nKeep it in the same folder as this script:\n" + ScriptDir());
 
-            string json = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "flp2vid_" + Guid.NewGuid().ToString("N") + ".json");
+            string json = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "sunviz_" + Guid.NewGuid().ToString("N") + ".json");
+            string extractDir = null;
+            string projectPath = path;
             try
             {
-                ProcessStartInfo psi = new ProcessStartInfo(exe, Quote(path) + " " + Quote(json));
+                if (string.Equals(System.IO.Path.GetExtension(path), ".zip", StringComparison.OrdinalIgnoreCase))
+                {
+                    extractDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "Sunviz_" + Guid.NewGuid().ToString("N"));
+                    Directory.CreateDirectory(extractDir);
+                    ExtractZip(path, extractDir);
+                    string[] projects = Directory.GetFiles(extractDir, "*.flp", SearchOption.AllDirectories);
+                    Array.Sort(projects, StringComparer.OrdinalIgnoreCase);
+                    if (projects.Length == 0)
+                        throw new UserError("The ZIP archive does not contain an FL Studio project (.flp).");
+                    projectPath = Ui.ChooseProject(null, projects);
+                    if (projectPath == null) throw new UserError("No FL Studio project was selected from the ZIP archive.");
+                }
+                if (!string.Equals(System.IO.Path.GetExtension(projectPath), ".flp", StringComparison.OrdinalIgnoreCase))
+                    throw new UserError("Please select an FL Studio project (.flp) or a ZIP archive (.zip).");
+
+                ProcessStartInfo psi = new ProcessStartInfo(exe, Quote(projectPath) + " " + Quote(json));
                 psi.UseShellExecute = false;
                 psi.CreateNoWindow = true;
                 psi.RedirectStandardError = true;
@@ -585,7 +878,166 @@ namespace FlpToVideo
             finally
             {
                 try { if (File.Exists(json)) File.Delete(json); } catch { }
+                try { if (extractDir != null && Directory.Exists(extractDir)) Directory.Delete(extractDir, true); } catch { }
             }
+        }
+
+        // Extract ZIP without depending on System.IO.Compression.FileSystem.
+        // Primary path: System.IO.Compression.ZipArchive via reflection (pure managed).
+        // Fallback: Windows Shell.Application (built into Explorer, no external tools).
+        static void ExtractZip(string archive, string destination)
+        {
+            Exception managedError = null;
+            try
+            {
+                ExtractZipManaged(archive, destination);
+                return;
+            }
+            catch (Exception ex)
+            {
+                managedError = ex;
+                while (managedError.InnerException != null) managedError = managedError.InnerException;
+            }
+
+            try
+            {
+                ExtractZipShell(archive, destination);
+                return;
+            }
+            catch (Exception shellEx)
+            {
+                Exception cause = shellEx;
+                while (cause.InnerException != null) cause = cause.InnerException;
+                string detail = managedError != null
+                    ? "Managed: " + managedError.Message + "\nShell: " + cause.Message
+                    : cause.Message;
+                throw new UserError("Couldn't extract the ZIP archive.\n\n" + detail +
+                    "\n\nSunviz extracts ZIPs with System.IO.Compression (no extra DLLs) and falls back to the built-in Windows Explorer ZIP support. No external ZIP utility is required.");
+            }
+        }
+
+        static void ExtractZipManaged(string archive, string destination)
+        {
+            object zip = null;
+            FileStream file = null;
+            try
+            {
+                System.Reflection.Assembly compression = System.Reflection.Assembly.Load("System.IO.Compression");
+                Type archiveType = compression.GetType("System.IO.Compression.ZipArchive", true);
+                Type modeType = compression.GetType("System.IO.Compression.ZipArchiveMode", true);
+                object readMode = Enum.Parse(modeType, "Read");
+                file = File.OpenRead(archive);
+                // ZipArchive(Stream, ZipArchiveMode, bool leaveOpen)
+                zip = Activator.CreateInstance(archiveType, new object[] { file, readMode, false });
+
+                string root = System.IO.Path.GetFullPath(destination);
+                if (!root.EndsWith(System.IO.Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal))
+                    root += System.IO.Path.DirectorySeparatorChar;
+
+                System.Collections.IEnumerable entries =
+                    (System.Collections.IEnumerable)archiveType.GetProperty("Entries").GetValue(zip, null);
+                foreach (object entry in entries)
+                {
+                    Type entryType = entry.GetType();
+                    string name = Convert.ToString(entryType.GetProperty("FullName").GetValue(entry, null));
+                    if (string.IsNullOrEmpty(name)) continue;
+
+                    // ZIP paths are relative. Reject rooted paths and traversal attempts.
+                    string relative = name.Replace('/', System.IO.Path.DirectorySeparatorChar).Replace('\\', System.IO.Path.DirectorySeparatorChar);
+                    if (System.IO.Path.IsPathRooted(relative)) throw new Exception("The archive contains an unsafe absolute path.");
+                    string target = System.IO.Path.GetFullPath(System.IO.Path.Combine(root, relative));
+                    if (!target.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                        throw new Exception("The archive contains an unsafe path: " + name);
+
+                    if (name.EndsWith("/", StringComparison.Ordinal) || name.EndsWith("\\", StringComparison.Ordinal))
+                    {
+                        Directory.CreateDirectory(target);
+                        continue;
+                    }
+
+                    string parent = System.IO.Path.GetDirectoryName(target);
+                    if (!Directory.Exists(parent)) Directory.CreateDirectory(parent);
+
+                    // Prefer Open() then manual copy (avoids ExtractToFile / FileSystem dependency)
+                    System.Reflection.MethodInfo openMethod = entryType.GetMethod("Open", Type.EmptyTypes);
+                    if (openMethod == null) throw new Exception("ZipArchiveEntry.Open not found.");
+                    object input = openMethod.Invoke(entry, null);
+                    try
+                    {
+                        using (Stream source = (Stream)input)
+                        using (FileStream output = new FileStream(target, FileMode.Create, FileAccess.Write, FileShare.None))
+                        {
+                            byte[] buffer = new byte[81920];
+                            int read;
+                            while ((read = source.Read(buffer, 0, buffer.Length)) > 0)
+                                output.Write(buffer, 0, read);
+                        }
+                    }
+                    finally
+                    {
+                        IDisposable disposable = input as IDisposable;
+                        if (disposable != null) disposable.Dispose();
+                    }
+                }
+            }
+            finally
+            {
+                IDisposable d = zip as IDisposable;
+                if (d != null) d.Dispose();
+                if (file != null) file.Dispose();
+            }
+        }
+
+        // Fallback using the Shell.Application COM object that ships with Windows Explorer.
+        // Uses careful late-binding and a short wait so CopyHere finishes before we return.
+        static void ExtractZipShell(string archive, string destination)
+        {
+            Type shellType = Type.GetTypeFromProgID("Shell.Application");
+            if (shellType == null) throw new Exception("Shell.Application ProgID not available.");
+
+            object shell = Activator.CreateInstance(shellType);
+            object zipNs = shellType.InvokeMember("NameSpace", System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] { archive });
+            if (zipNs == null) throw new Exception("Could not open the ZIP as a Shell folder (NameSpace returned null).");
+
+            object destNs = shellType.InvokeMember("NameSpace", System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] { destination });
+            if (destNs == null) throw new Exception("Could not open the destination folder.");
+
+            // Items collection
+            object items = zipNs.GetType().InvokeMember("Items", System.Reflection.BindingFlags.InvokeMethod, null, zipNs, null);
+            if (items == null) throw new Exception("ZIP Items collection is empty or unavailable.");
+
+            // CopyHere options: 4 = no progress UI, 16 = yes to all, 512 = no confirm mkdir, 1024 = no error UI
+            // Combined flags commonly used for silent extract.
+            object[] copyArgs = new object[] { items, 4 | 16 | 512 | 1024 };
+            destNs.GetType().InvokeMember("CopyHere", System.Reflection.BindingFlags.InvokeMethod, null, destNs, copyArgs);
+
+            // Shell CopyHere is asynchronous. Wait until the expected number of top-level items appear
+            // or a timeout expires.
+            int expected = 0;
+            try
+            {
+                object countObj = items.GetType().InvokeMember("Count", System.Reflection.BindingFlags.GetProperty, null, items, null);
+                expected = Convert.ToInt32(countObj);
+            }
+            catch { expected = 1; }
+
+            DateTime deadline = DateTime.UtcNow.AddSeconds(60);
+            while (DateTime.UtcNow < deadline)
+            {
+                System.Threading.Thread.Sleep(150);
+                try
+                {
+                    object destItems = destNs.GetType().InvokeMember("Items", System.Reflection.BindingFlags.InvokeMethod, null, destNs, null);
+                    object destCount = destItems.GetType().InvokeMember("Count", System.Reflection.BindingFlags.GetProperty, null, destItems, null);
+                    if (Convert.ToInt32(destCount) >= expected) break;
+                }
+                catch { /* keep waiting */ }
+            }
+
+            // Final sanity: at least one file should exist under destination
+            string[] any = Directory.GetFiles(destination, "*", SearchOption.AllDirectories);
+            if (any.Length == 0)
+                throw new Exception("Shell extraction finished but no files were written (timeout or access denied).");
         }
 
         static string Quote(string s) { return "\"" + s.Replace("\"", "\\\"") + "\""; }
@@ -599,8 +1051,8 @@ namespace FlpToVideo
         {
             List<string> dirs = new List<string>();
             dirs.Add(ScriptDir());
-            dirs.Add(System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "FLP to Video"));
-            dirs.Add(System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Vegas Script Menu\\FLP TO VIDEO"));
+            dirs.Add(System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Sunviz"));
+            dirs.Add(System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Vegas Script Menu\\SUNVIZ"));
             foreach (string d in dirs)
             {
                 try
@@ -1248,18 +1700,19 @@ namespace FlpToVideo
 
     internal sealed class Settings
     {
-        public string LastFlp = "", Arrangement = "";
+        public string LastFlp = "", Arrangement = "", Language = "English", ThemeName = "Light";
         public int StartMode, Destination, MinLen, MaxLen, LongMode, StepLen, SlideMode, PitchMode, Root = 60, Tab;
         public Pose SlidePose = new Pose(112, 0, 0, 0);
         public double SlideEaseMs = 150;
         public string CustomStart = "0:00.000";
         public bool Velocity = true, IncludeMuted, Audio = true;
+        public TrackMotionSpec TrackMotion = new TrackMotionSpec();
         public string Preset = "";
         public int WinW, WinH;            // 96-dpi units
         public readonly List<string> Checked = new List<string>();
         public readonly List<EffectSpec> Effects = new List<EffectSpec>();
 
-        static string Dir { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "FLP to Video"); } }
+        static string Dir { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Sunviz"); } }
         static string FilePath { get { return Path.Combine(Dir, "settings.txt"); } }
         static string PresetDir { get { return Path.Combine(Dir, "Presets"); } }
         const string PresetExt = ".preset";
@@ -1278,6 +1731,8 @@ namespace FlpToVideo
                     switch (k)
                     {
                         case "flp": s.LastFlp = v; break;
+                        case "language": s.Language = v; break;
+                        case "theme": s.ThemeName = v; break;
                         case "arrangement": s.Arrangement = v; break;
                         case "stepLength": s.StepLen = Int(v, 0, Planner.StepNames.Length - 1); break;
                         case "slides": s.SlideMode = Int(v, 0, Planner.SlideNames.Length - 1); break;
@@ -1295,6 +1750,7 @@ namespace FlpToVideo
                         case "maxLength": s.MaxLen = Int(v, 0, Planner.LengthNames.Length - 1); break;
                         case "longNotes": s.LongMode = Int(v, 0, 2); break;
                         case "velocity": s.Velocity = v.Trim() != "0"; break;
+                        case "trackMotion": s.TrackMotion = TrackMotionSpec.Parse(v); break;
                         case "preset": s.Preset = v; break;
                         case "size": { string[] wh = v.Split('x'); if (wh.Length == 2) { s.WinW = Int(wh[0], 0, 10000); s.WinH = Int(wh[1], 0, 10000); } break; }
                         case "checked": s.Checked.Add(v); break;
@@ -1313,6 +1769,8 @@ namespace FlpToVideo
                 Directory.CreateDirectory(Dir);
                 List<string> l = new List<string>();
                 l.Add("flp=" + LastFlp);
+                l.Add("language=" + Language);
+                l.Add("theme=" + ThemeName);
                 l.Add("arrangement=" + Arrangement);
                 l.Add("stepLength=" + StepLen);
                 l.Add("slides=" + SlideMode);
@@ -1330,11 +1788,21 @@ namespace FlpToVideo
                 l.Add("maxLength=" + MaxLen);
                 l.Add("longNotes=" + LongMode);
                 l.Add("velocity=" + (Velocity ? "1" : "0"));
+                l.Add("trackMotion=" + TrackMotion.Serialize());
                 l.Add("preset=" + Preset);
                 if (WinW > 0 && WinH > 0) l.Add("size=" + WinW + "x" + WinH);
                 foreach (string c in Checked) l.Add("checked=" + c);
                 foreach (EffectSpec e in Effects) l.Add("fx=" + e.Serialize());
-                File.WriteAllLines(FilePath, l.ToArray(), Encoding.UTF8);
+                string tmp = FilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                File.WriteAllLines(tmp, l.ToArray(), Encoding.UTF8);
+                if (File.Exists(FilePath))
+                {
+                    string backup = FilePath + ".bak";
+                    try { if (File.Exists(backup)) File.Delete(backup); } catch { }
+                    try { File.Replace(tmp, FilePath, backup, true); }
+                    catch { File.Copy(tmp, FilePath, true); File.Delete(tmp); }
+                }
+                else File.Move(tmp, FilePath);
             }
             catch { }
         }
@@ -1371,16 +1839,27 @@ namespace FlpToVideo
             return b.ToString().Trim().TrimEnd('.');
         }
 
-        static string PresetPath(string name) { return Path.Combine(PresetDir, CleanName(name) + PresetExt); }
+        static string PresetPath(string name)
+        {
+            string safe = CleanName(name);
+            if (string.IsNullOrWhiteSpace(safe)) throw new UserError("Enter a valid preset name.");
+            return Path.Combine(PresetDir, safe + PresetExt);
+        }
 
-        public static bool PresetExists(string name) { return File.Exists(PresetPath(name)); }
+        public static bool PresetExists(string name)
+        {
+            try { return !string.IsNullOrWhiteSpace(name) && File.Exists(PresetPath(name)); }
+            catch { return false; }
+        }
 
         public static List<EffectSpec> LoadPreset(string name)
         {
             List<EffectSpec> list = new List<EffectSpec>();
-            foreach (string line in File.ReadAllLines(PresetPath(name), Encoding.UTF8))
+            string path = PresetPath(name);
+            if (!File.Exists(path)) throw new UserError("The selected preset no longer exists.");
+            foreach (string line in File.ReadAllLines(path, Encoding.UTF8))
             {
-                if (!line.StartsWith("fx=")) continue;
+                if (!line.StartsWith("fx=", StringComparison.Ordinal)) continue;
                 EffectSpec e = EffectSpec.Parse(line.Substring(3));
                 if (e != null) list.Add(e);
             }
@@ -1389,10 +1868,22 @@ namespace FlpToVideo
 
         public static void SavePreset(string name, List<EffectSpec> effects)
         {
+            string path = PresetPath(name);
             Directory.CreateDirectory(PresetDir);
             List<string> l = new List<string>();
-            foreach (EffectSpec e in effects) l.Add("fx=" + e.Serialize());
-            File.WriteAllLines(PresetPath(name), l.ToArray(), Encoding.UTF8);
+            foreach (EffectSpec e in effects) if (e != null) l.Add("fx=" + e.Serialize());
+            string tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                File.WriteAllLines(tmp, l.ToArray(), Encoding.UTF8);
+                if (File.Exists(path))
+                {
+                    try { File.Replace(tmp, path, null, true); }
+                    catch { File.Copy(tmp, path, true); File.Delete(tmp); }
+                }
+                else File.Move(tmp, path);
+            }
+            finally { try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }
         }
 
         public static void DeletePreset(string name)
@@ -1500,9 +1991,9 @@ namespace FlpToVideo
                 Native.Enable(main, false);       // keep the timeline still while we work
                 progress.Show(Native.VegasWindow());
                 progress.Refresh();
-                using (UndoBlock undo = new UndoBlock("FLP to Video"))
+                using (UndoBlock undo = new UndoBlock("Sunviz"))
                 {
-                    int insertAt = anchor != null && anchor.Track != null ? anchor.Track.Index : 0; // new tracks go just above the clip
+                    int insertAt = 0; // Sunviz always inserts generated video tracks at the very top of the VEGAS track stack.
                     for (int i = 0; i < plans.Count && !progress.Cancelled; i++)
                     {
                         VideoTrack track = job.Target;
@@ -1511,6 +2002,14 @@ namespace FlpToVideo
                             track = new VideoTrack(vegas.Project, insertAt++, names[i]);
                             vegas.Project.Tracks.Add(track);
                         }
+                        try
+                        {
+                            int fw = 1920, fh = 1080;
+                            try { fw = vegas.Project.Video.Width; fh = vegas.Project.Video.Height; } catch { }
+                            TrackMotionSpec.VegasApp = vegas;
+                            if (job.TrackMotion != null) job.TrackMotion.ApplyTo(track, fw, fh);
+                        }
+                        catch { }
                         AudioTrack audioTrack = null;
                         if (audio)
                         {
@@ -1936,7 +2435,7 @@ namespace FlpToVideo
     internal sealed class MainForm : Form
     {
         // Layout in 96-dpi pixels (scaled by Theme.D).
-        const int M = 16, HEAD = 58, FOOT = 58, GAP = 10, LEFT = 260, PAD = 16, KEY = 92, ROW = 28, PITCH = 38, TOP = 34;
+        const int M = 16, HEAD = 58, FOOT = 58, GAP = 10, LEFT = 260, PAD = 16, KEY = 118, ROW = 28, PITCH = 38, TOP = 34;
         public static readonly string[] TabNames = { "Placement", "Timing", "Notes", "Effects" };
 
         static readonly string[] LongHints = {
@@ -1970,8 +2469,10 @@ namespace FlpToVideo
         Panel[] pages;
         ChannelList chList;
         Segmented startSeg, destSeg, longSeg, slideSeg, pitchSeg, mutedSeg;
-        Dropdown arrDd, minDd, maxDd, stepDd, rootDd, presetDd;
+        Dropdown arrDd, minDd, maxDd, stepDd, rootDd, presetDd, languageDd, themeDd;
         Toggle opToggle, audioToggle;
+        Btn trackMotionBtn;
+        TrackMotionSpec trackMotionSpec = new TrackMotionSpec();
         PosePanel slidePose;
         Panel fxPanel;
 
@@ -1997,7 +2498,7 @@ namespace FlpToVideo
             if (targetTrack != null)
                 targetName = string.IsNullOrEmpty(targetTrack.Name) ? "Track " + (targetTrack.Index + 1) : targetTrack.Name;
 
-            Text = "FLP to Video";
+            Text = "Sunviz";
             AutoScaleMode = AutoScaleMode.None;
             Font = Theme.Base;
             BackColor = Theme.Bg;
@@ -2006,13 +2507,20 @@ namespace FlpToVideo
             MaximizeBox = true;
             MinimizeBox = false;
             ShowInTaskbar = false;
-            ShowIcon = false;
+            ShowIcon = true;
+            try
+            {
+                string iconPath = Path.Combine(Path.GetDirectoryName(Script.File), "Sunviz.ico");
+                if (File.Exists(iconPath)) Icon = new Icon(iconPath);
+            }
+            catch { }
             StartPosition = FormStartPosition.CenterParent;
             DoubleBuffered = true;
             KeyPreview = true;
             tips = Theme.MakeToolTip();
 
             Build();
+            ApplyLanguage();
             foreach (EffectSpec e in st.Effects) effects.Add(e.Clone());
             RebuildRows();
             RefreshPresets(st.Preset);
@@ -2029,6 +2537,288 @@ namespace FlpToVideo
             DoLayout();
         }
 
+        void ApplyLanguage()
+        {
+            Dictionary<string, string[]> words = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "Sunviz", new string[] { "Sunviz", "Sunviz", "Sunviz" } },
+                { "Change FLP…", new string[] { "Change FLP…", "Изменить FLP…", "Cambiar FLP…" } },
+                { "Arrangement", new string[] { "Arrangement", "Аранжировка", "Arreglo" } },
+                { "Choose language", new string[] { "Choose language", "Язык", "Idioma" } },
+                { "Theme", new string[] { "Theme", "Тема", "Tema" } },
+                { "Light", new string[] { "Light", "Светлая", "Claro" } },
+                { "Dark", new string[] { "Dark", "Тёмная", "Oscuro" } },
+                { "Sunset", new string[] { "Sunset", "Закат", "Atardecer" } },
+                { "Sunrise", new string[] { "Sunrise", "Рассвет", "Amanecer" } },
+                { "Start", new string[] { "Start", "Начало", "Inicio" } },
+                { "Extend", new string[] { "Extend", "Продлить", "Extender" } },
+                { "Freeze", new string[] { "Freeze", "Заморозить", "Congelar" } },
+                { "Stretch", new string[] { "Stretch", "Растянуть", "Estirar" } },
+                { "Only audio clips in this arrangement — no notes to slide or pitch.", new string[] { "Only audio clips in this arrangement — no notes to slide or pitch.", "В этой аранжировке только аудиоклипы — нет нот для скольжения или изменения высоты.", "Solo hay clips de audio en este arreglo; no hay notas para deslizar o cambiar el tono." } },
+                { "No saved presets yet", new string[] { "No saved presets yet", "Сохранённых пресетов пока нет", "Aún no hay ajustes guardados" } },
+                { "Add effect", new string[] { "Add effect", "Добавить эффект", "Añadir efecto" } },
+                { "Open", new string[] { "Open", "Открыть", "Abrir" } },
+                { "Select FLP", new string[] { "Select FLP", "Выбрать FLP", "Seleccionar FLP" } },
+                { "None selected on the timeline", new string[] { "None selected on the timeline", "На таймлайне ничего не выбрано", "No hay nada seleccionado en la línea de tiempo" } },
+                { "channel", new string[] { "channel", "канал", "canal" } },
+                { "no clip", new string[] { "no clip", "нет клипа", "sin clip" } },
+                { "subclip", new string[] { "subclip", "субклип", "subclip" } },
+                { "subclips", new string[] { "subclips", "субклипов", "subclips" } },
+                { "tempo automation", new string[] { "tempo automation", "автоматизация темпа", "automatización de tempo" } },
+                { "Something went wrong:", new string[] { "Something went wrong:", "Произошла ошибка:", "Algo salió mal:" } },
+                { "Select the clip to place first.", new string[] { "Select the clip to place first.", "Сначала выберите клип для размещения.", "Primero selecciona el clip que se colocará." } },
+                { "Tick at least one channel.", new string[] { "Tick at least one channel.", "Выберите хотя бы один канал.", "Marca al menos un canal." } },
+                { "Pan/Crop keyframes", new string[] { "Pan/Crop keyframes", "Ключевые кадры панорамирования/кадрирования", "Fotogramas clave de panorámica/recorte" } },
+                { "Reset", new string[] { "Reset", "Сбросить", "Restablecer" } },
+                { "Zoom", new string[] { "Zoom", "Масштаб", "Zoom" } },
+                { "Angle", new string[] { "Angle", "Угол", "Ángulo" } },
+                { "Nothing here", new string[] { "Nothing here", "Здесь ничего нет", "No hay nada aquí" } },
+                { "Change FLP", new string[] { "Change FLP", "Изменить FLP", "Cambiar FLP" } },
+                { "Channels", new string[] { "Channels", "Каналы", "Canales" } },
+                { "All", new string[] { "All", "Все", "Todos" } },
+                { "None", new string[] { "None", "Ничего", "Ninguno" } },
+                { "Clip", new string[] { "Clip", "Клип", "Clip" } },
+                { "Start at", new string[] { "Start at", "Начать с", "Empezar en" } },
+                { "Put on", new string[] { "Put on", "Разместить на", "Colocar en" } },
+                { "New tracks", new string[] { "New tracks", "Новые дорожки", "Pistas nuevas" } },
+                { "Selected track", new string[] { "Selected track", "Выбранная дорожка", "Pista seleccionada" } },
+                { "Audio", new string[] { "Audio", "Аудио", "Audio" } },
+                { "Length", new string[] { "Length", "Длительность", "Duración" } },
+                { "Effects", new string[] { "Effects", "Эффекты", "Efectos" } },
+                { "Notes", new string[] { "Notes", "Ноты", "Notas" } },
+                { "Placement", new string[] { "Placement", "Размещение", "Colocación" } },
+                { "Timing", new string[] { "Timing", "Время", "Tiempo" } },
+                { "Save", new string[] { "Save", "Сохранить", "Guardar" } },
+                { "Delete", new string[] { "Delete", "Удалить", "Eliminar" } },
+                { "Cancel", new string[] { "Cancel", "Отмена", "Cancelar" } },
+                { "Generate", new string[] { "Generate", "Создать", "Generar" } },
+                { "Presets", new string[] { "Presets", "Пресеты", "Preajustes" } },
+                { "Preset name", new string[] { "Preset name", "Имя пресета", "Nombre del preajuste" } },
+                { "BPM", new string[] { "BPM", "BPM", "BPM" } },
+                { "Project start", new string[] { "Project start", "Начало проекта", "Inicio del proyecto" } },
+                { "Cursor", new string[] { "Cursor", "Курсор", "Cursor" } },
+                { "Custom", new string[] { "Custom", "Своё", "Personalizado" } },
+                { "Step length", new string[] { "Step length", "Длина шага", "Duración del paso" } },
+                { "Slide", new string[] { "Slide", "Скольжение", "Deslizamiento" } },
+                { "Pitch", new string[] { "Pitch", "Высота тона", "Tono" } },
+                { "Root", new string[] { "Root", "Основная нота", "Nota raíz" } },
+                { "Muted", new string[] { "Muted", "Отключённые", "Silenciados" } },
+                { "Save preset", new string[] { "Save preset", "Сохранить пресет", "Guardar preajuste" } },
+                { "Delete preset", new string[] { "Delete preset", "Удалить пресет", "Eliminar preajuste" } },
+                { "Step hits", new string[] { "Step hits", "Шаговые хиты", "Golpes de paso" } },
+                { "Long notes", new string[] { "Long notes", "Длинные ноты", "Notas largas" } },
+                { "Slides", new string[] { "Slides", "Скольжения", "Deslizamientos" } },
+                { "Slide pose", new string[] { "Slide pose", "Поза слайда", "Pose de deslizamiento" } },
+                { "to", new string[] { "to", "до", "a" } },
+                { "Skip", new string[] { "Skip", "Пропуск", "Omitir" } },
+                { "Include", new string[] { "Include", "Включить", "Incluir" } },
+                { "Continue", new string[] { "Continue", "Продолжить", "Continuar" } },
+                { "Pop", new string[] { "Pop", "Поп", "Pop" } },
+                { "Toggle", new string[] { "Toggle", "Перекл.", "Alternar" } },
+                { "New clip", new string[] { "New clip", "Новый клип", "Nuevo clip" } },
+                { "Off", new string[] { "Off", "Выкл", "Apagado" } },
+                { "Shift", new string[] { "Shift", "Сдвиг", "Desplazar" } },
+                { "Resample", new string[] { "Resample", "Ресэмпл", "Remuestrear" } },
+                { "Pick Pop or Toggle to set where a slide sends the picture.", new string[] { "Pick Pop or Toggle to set where a slide sends the picture.", "Выберите Поп или Перекл., чтобы задать, куда слайд отправит картинку.", "Elige Pop o Alternar para indicar adónde envía el deslizamiento la imagen." } },
+                { "No effects — clips are placed as they are.", new string[] { "No effects — clips are placed as they are.", "Нет эффектов — клипы размещаются как есть.", "Sin efectos: los clips se colocan tal cual." } },
+                { "+  Add effect", new string[] { "+  Add effect", "+  Добавить эффект", "+  Añadir efecto" } },
+                { "Velocity sync", new string[] { "Velocity sync", "Синхр. Velocity", "Sinc. Velocity" } },
+                { "Opacity", new string[] { "Opacity", "Прозрачность", "Opacidad" } },
+                { "Until next hit", new string[] { "Until next hit", "До след. хита", "Hasta el sig." } },
+                { "Sample length", new string[] { "Sample length", "Длина сэмпла", "Long. muestra" } },
+                { "1/1 (bar)", new string[] { "1/1 (bar)", "1/1 (такт)", "1/1 (compás)" } },
+                { "already added", new string[] { "already added", "уже добавлено", "ya añadido" } },
+                { "MOTION", new string[] { "MOTION", "ДВИЖЕНИЕ", "MOVIMIENTO" } },
+                { "COLOR", new string[] { "COLOR", "ЦВЕТ", "COLOR" } },
+                { "LIGHT & TIME", new string[] { "LIGHT & TIME", "СВЕТ И ВРЕМЯ", "LUZ Y TIEMPO" } },
+                { "Pan/Crop", new string[] { "Pan/Crop", "Pan/Crop", "Pan/Crop" } },
+                { "Rotate", new string[] { "Rotate", "Поворот", "Rotar" } },
+                { "Move", new string[] { "Move", "Сдвиг", "Mover" } },
+                { "Flip", new string[] { "Flip", "Отражение", "Voltear" } },
+                { "Hue shift", new string[] { "Hue shift", "Оттенок", "Tono" } },
+                { "Hue steps", new string[] { "Hue steps", "Шаги оттенка", "Pasos de tono" } },
+                { "Saturation", new string[] { "Saturation", "Насыщенность", "Saturación" } },
+                { "Contrast", new string[] { "Contrast", "Контраст", "Contraste" } },
+                { "Negative", new string[] { "Negative", "Негатив", "Negativo" } },
+                { "Greyscale", new string[] { "Greyscale", "Ч/б", "Escala grises" } },
+                { "Flash", new string[] { "Flash", "Вспышка", "Flash" } },
+                { "Fade", new string[] { "Fade", "Затухание", "Fundido" } },
+                { "Blur", new string[] { "Blur", "Размытие", "Desenfoque" } },
+                { "Reverse", new string[] { "Reverse", "Реверс", "Reversa" } },
+                { "Ease", new string[] { "Ease", "Плавн.", "Suav." } },
+                { "ms", new string[] { "ms", "мс", "ms" } },
+                { "Track Motion…", new string[] { "Track Motion…", "Track Motion…", "Track Motion…" } },
+                { "Edit keyframes…", new string[] { "Edit keyframes…", "Кадры…", "Editar fotogramas…" } },
+                { "Horizontal", new string[] { "Horizontal", "Горизонт.", "Horizontal" } },
+                { "Vertical", new string[] { "Vertical", "Вертикаль", "Vertical" } },
+                { "Both", new string[] { "Both", "Оба", "Ambos" } },
+                { "Ease out", new string[] { "Ease out", "Плавн. исход", "Ease out" } },
+                { "Ease in", new string[] { "Ease in", "Плавн. вход", "Ease in" } },
+                { "Linear", new string[] { "Linear", "Линейно", "Lineal" } },
+
+            };
+            int lang = languageDd == null ? 0 : languageDd.Value;
+            if (lang < 0 || lang > 2) lang = 0;
+            ApplyLanguageTo(this, words, lang);
+            if (themeDd != null && themeDd.Items.Count == 4)
+            {
+                int selectedTheme = themeDd.Value;
+                string[][] captions = {
+                    new string[] { "Light", "Светлая", "Claro" },
+                    new string[] { "Dark", "Тёмная", "Oscuro" },
+                    new string[] { "Sunset", "Закат", "Atardecer" },
+                    new string[] { "Sunrise", "Рассвет", "Amanecer" }
+                };
+                for (int i = 0; i < 4; i++) themeDd.Items[i] = captions[i][lang];
+                themeDd.SetValueSilently(selectedTheme < 0 ? 0 : selectedTheme);
+                themeDd.Invalidate();
+            }
+            // Keep language names fixed (they are the language identifiers themselves)
+            if (languageDd != null && languageDd.Items.Count == 3)
+            {
+                languageDd.Items[0] = "English";
+                languageDd.Items[1] = "Русский";
+                languageDd.Items[2] = "Español";
+                languageDd.Invalidate();
+            }
+
+            // Translate tabs
+            if (tabs != null)
+            {
+                string[][] tabCaps = {
+                    new string[] { "Placement", "Размещение", "Colocación" },
+                    new string[] { "Timing", "Время", "Tiempo" },
+                    new string[] { "Notes", "Ноты", "Notas" },
+                    new string[] { "Effects", "Эффекты", "Efectos" }
+                };
+                tabs.SetItems(tabCaps[0][lang], tabCaps[1][lang], tabCaps[2][lang], tabCaps[3][lang]);
+            }
+
+            // Translate segmented controls
+            if (startSeg != null)
+            {
+                string[][] caps = {
+                    new string[] { "Project start", "Начало проекта", "Inicio del proyecto" },
+                    new string[] { "Cursor", "Курсор", "Cursor" },
+                    new string[] { "Custom", "Своё", "Personalizado" }
+                };
+                startSeg.SetItems(caps[0][lang], caps[1][lang], caps[2][lang]);
+            }
+            if (destSeg != null)
+            {
+                string[][] caps = {
+                    new string[] { "New tracks", "Новые дорожки", "Pistas nuevas" },
+                    new string[] { "Selected track", "Выбранная дорожка", "Pista seleccionada" }
+                };
+                destSeg.SetItems(caps[0][lang], caps[1][lang]);
+            }
+            if (longSeg != null)
+            {
+                string[][] caps = {
+                    new string[] { "Extend", "Продлить", "Extender" },
+                    new string[] { "Freeze", "Заморозить", "Congelar" },
+                    new string[] { "Stretch", "Растянуть", "Estirar" }
+                };
+                longSeg.SetItems(caps[0][lang], caps[1][lang], caps[2][lang]);
+            }
+            if (slideSeg != null)
+            {
+                string[][] caps = {
+                    new string[] { "Continue", "Продолжить", "Continuar" },
+                    new string[] { "Pop", "Поп", "Pop" },
+                    new string[] { "Toggle", "Перекл.", "Alternar" },
+                    new string[] { "New clip", "Новый клип", "Nuevo clip" }
+                };
+                slideSeg.SetItems(caps[0][lang], caps[1][lang], caps[2][lang], caps[3][lang]);
+            }
+            if (pitchSeg != null)
+            {
+                string[][] caps = {
+                    new string[] { "Off", "Выкл", "Apagado" },
+                    new string[] { "Shift", "Сдвиг", "Desplazar" },
+                    new string[] { "Resample", "Ресэмпл", "Remuestrear" }
+                };
+                pitchSeg.SetItems(caps[0][lang], caps[1][lang], caps[2][lang]);
+            }
+            if (mutedSeg != null)
+            {
+                string[][] caps = {
+                    new string[] { "Skip", "Пропуск", "Omitir" },
+                    new string[] { "Include", "Включить", "Incluir" }
+                };
+                try { mutedSeg.SetItems(caps[0][lang], caps[1][lang]); } catch { }
+            }
+
+            // Translate length / step dropdown lists (index meanings stay the same)
+            if (minDd != null && maxDd != null)
+            {
+                string[][] len = {
+                    new string[] { "Off", "Выкл", "Apagado" },
+                    new string[] { "1/64", "1/64", "1/64" },
+                    new string[] { "1/32", "1/32", "1/32" },
+                    new string[] { "1/16", "1/16", "1/16" },
+                    new string[] { "1/8", "1/8", "1/8" },
+                    new string[] { "1/4", "1/4", "1/4" },
+                    new string[] { "1/2", "1/2", "1/2" },
+                    new string[] { "1/1 (bar)", "1/1 (такт)", "1/1 (compás)" }
+                };
+                int vmin = minDd.Value, vmax = maxDd.Value;
+                minDd.Items.Clear();
+                maxDd.Items.Clear();
+                for (int i = 0; i < len.Length; i++)
+                {
+                    minDd.Items.Add(len[i][lang]);
+                    maxDd.Items.Add(len[i][lang]);
+                }
+                minDd.SetValueSilently(vmin);
+                maxDd.SetValueSilently(vmax);
+                minDd.Invalidate();
+                maxDd.Invalidate();
+            }
+            if (stepDd != null)
+            {
+                string[][] steps = {
+                    new string[] { "Until next hit", "До след. хита", "Hasta el sig." },
+                    new string[] { "Sample length", "Длина сэмпла", "Long. muestra" },
+                    new string[] { "1/64", "1/64", "1/64" },
+                    new string[] { "1/32", "1/32", "1/32" },
+                    new string[] { "1/16", "1/16", "1/16" },
+                    new string[] { "1/8", "1/8", "1/8" },
+                    new string[] { "1/4", "1/4", "1/4" },
+                    new string[] { "1/2", "1/2", "1/2" },
+                    new string[] { "1/1 (bar)", "1/1 (такт)", "1/1 (compás)" }
+                };
+                int vs = stepDd.Value;
+                stepDd.Items.Clear();
+                for (int i = 0; i < steps.Length; i++) stepDd.Items.Add(steps[i][lang]);
+                stepDd.SetValueSilently(vs);
+                stepDd.Invalidate();
+            }
+
+            // Relayout so buttons/segments grow to fit translated text
+            try { UpdateTrackMotionButton(); } catch { }
+            try { DoLayout(); } catch { }
+        }
+
+        static void ApplyLanguageTo(Control parent, Dictionary<string, string[]> words, int lang)
+        {
+            foreach (Control c in parent.Controls)
+            {
+                // Skip custom dropdowns and text entry fields; they are updated explicitly where needed
+                if (!(c is ComboBox) && !(c is Dropdown) && !(c is NumBox) && !(c is TimeField))
+                {
+                    foreach (KeyValuePair<string, string[]> pair in words)
+                    {
+                        bool match = false;
+                        for (int i = 0; i < pair.Value.Length; i++)
+                            if (string.Equals(c.Text, pair.Value[i], StringComparison.OrdinalIgnoreCase)) { match = true; break; }
+                        if (match) { c.Text = pair.Value[lang]; break; }
+                    }
+                }
+                ApplyLanguageTo(c, words, lang);
+            }
+        }
+
         // ---------------------------------------------------------------- building
 
         Label Lbl(Control parent, string text, Color color)
@@ -2036,7 +2826,7 @@ namespace FlpToVideo
             Label l = new Label();
             l.AutoSize = false;
             l.UseMnemonic = false;
-            l.AutoEllipsis = true;
+            l.AutoEllipsis = false;
             l.TextAlign = ContentAlignment.MiddleLeft;
             l.ForeColor = color;
             l.Text = text;
@@ -2055,7 +2845,7 @@ namespace FlpToVideo
         void Build()
         {
             // header
-            titleLbl = Lbl(this, "FLP → Video", Theme.Text);
+            titleLbl = Lbl(this, "Sunviz", Theme.Text);
             titleLbl.Font = Theme.Title;
             fileLbl = Lbl(this, "", Theme.Dim);
             arrDd = new Dropdown(new string[0]);
@@ -2070,6 +2860,30 @@ namespace FlpToVideo
             changeBtn = new Btn("Change FLP…", BtnKind.Secondary);
             changeBtn.Click += delegate { ChangeFlp(); };
             Controls.Add(changeBtn);
+
+            languageDd = new Dropdown(new string[] { "English", "Русский", "Español" });
+            languageDd.Value = settings.Language == "Русский" ? 1 : settings.Language == "Español" ? 2 : 0;
+            languageDd.Changed += delegate
+            {
+                settings.Language = languageDd.Items[Math.Max(0, languageDd.Value)];
+                ApplyLanguage();
+            };
+            Controls.Add(languageDd);
+            tips.SetToolTip(languageDd, "Language / Язык / Idioma");
+
+            themeDd = new Dropdown(new string[] { "Light", "Dark", "Sunset", "Sunrise" });
+            string[] themeKeys = { "Light", "Dark", "Sunset", "Sunrise" };
+            int themeIndex = Array.IndexOf(themeKeys, settings.ThemeName);
+            themeDd.Value = themeIndex < 0 ? 0 : themeIndex;
+            themeDd.Changed += delegate
+            {
+                settings.ThemeName = themeKeys[Math.Max(0, themeDd.Value)];
+                Theme.Set(settings.ThemeName);
+                Theme.Recolor(this);
+                DoLayout();
+            };
+            Controls.Add(themeDd);
+            tips.SetToolTip(themeDd, "Theme / Тема / Tema");
 
             // channels (always visible: every tab applies to the ticked channels)
             chCard = AddCard("Channels");
@@ -2117,6 +2931,25 @@ namespace FlpToVideo
             audioToggle.Checked = settings.Audio;
             audioToggle.Changed += delegate { SyncHints(); UpdateSummary(); };
             place.Controls.Add(audioToggle);
+            opKey = Lbl(place, "Velocity sync", Theme.Dim);
+            opToggle = new Toggle();
+            opToggle.Checked = settings.Velocity;
+            opToggle.Changed += delegate { SyncHints(); };
+            place.Controls.Add(opToggle);
+            tips.SetToolTip(opToggle, "On: track opacity follows note velocity from the FLP pattern. Off: opacity stays at 100%.");
+            trackMotionSpec = settings.TrackMotion != null ? settings.TrackMotion.Clone() : new TrackMotionSpec();
+            try
+            {
+                int fw = FrameRef.Width > 0 ? FrameRef.Width : 1920;
+                int fh = FrameRef.Height > 0 ? FrameRef.Height : 1080;
+                if (trackMotionSpec.Width < 2) trackMotionSpec.Width = fw;
+                if (trackMotionSpec.Height < 2) trackMotionSpec.Height = fh;
+            }
+            catch { }
+            trackMotionBtn = new Btn("Track Motion…", BtnKind.Secondary);
+            trackMotionBtn.Click += delegate { OpenTrackMotion(); };
+            place.Controls.Add(trackMotionBtn);
+            tips.SetToolTip(trackMotionBtn, "Set Track Motion (position, size, rotation) applied to each generated video track.");
 
             // -- timing
             lenKey = Lbl(time, "Length", Theme.Dim);
@@ -2141,12 +2974,6 @@ namespace FlpToVideo
             longSeg.Value = settings.LongMode;
             longSeg.Changed += delegate { SyncHints(); };
             time.Controls.Add(longSeg);
-            opKey = Lbl(time, "Opacity", Theme.Dim);
-            opKey.TextAlign = ContentAlignment.MiddleRight;
-            opToggle = new Toggle();
-            opToggle.Checked = settings.Velocity;
-            opToggle.Changed += delegate { SyncHints(); };
-            time.Controls.Add(opToggle);
             mutedKey = Lbl(time, "Muted", Theme.Dim);
             tips.SetToolTip(mutedKey, "Clips that are muted in the playlist, or sit on a muted playlist track.");
             mutedSeg = new Segmented("Skip", "Include");
@@ -2270,17 +3097,40 @@ namespace FlpToVideo
             return y + D(PITCH);
         }
 
+        static int TextWidth(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return 0;
+            return TextRenderer.MeasureText(text, Theme.Base).Width;
+        }
+
+        /// <summary>Minimum width so every segment label fits without ellipsis.</summary>
+        static int MeasureSegWidth(Segmented seg, int rowH)
+        {
+            if (seg == null) return D(120);
+            int pad = Theme.D(28); // left+right padding per slot
+            int total = 0;
+            string[] items = seg.GetItems();
+            if (items == null || items.Length == 0) return D(120);
+            foreach (string s in items)
+                total += Math.Max(Theme.D(48), TextRenderer.MeasureText(s ?? "", Theme.Semi).Width + pad);
+            return Math.Max(Theme.D(120), total);
+        }
+
         void DoLayout()
         {
             if (goBtn == null) return;
             int W = ClientSize.Width, H = ClientSize.Height;
             int m = D(M), pad = D(PAD), key = D(KEY), row = D(ROW), gap = D(GAP);
 
-            // header
-            changeBtn.SetBounds(W - m - D(116), D(15), D(116), row);
-            bpmUnit.SetBounds(changeBtn.Left - D(10) - D(34), D(15), D(34), row);
-            bpmBox.SetBounds(bpmUnit.Left - D(4) - D(66), D(15), D(66), row);
-            arrDd.SetBounds(bpmBox.Left - D(10) - D(170), D(15), D(170), row);
+            // header — keep BPM, theme, language and Change FLP on one line; widths follow text
+            int btnH = row;
+            int changeW = Math.Max(D(100), TextWidth(changeBtn.Text) + D(28));
+            changeBtn.SetBounds(W - m - changeW, D(15), changeW, btnH);
+            languageDd.SetBounds(changeBtn.Left - D(8) - D(100), D(15), D(100), btnH);
+            themeDd.SetBounds(languageDd.Left - D(8) - D(100), D(15), D(100), btnH);
+            bpmUnit.SetBounds(themeDd.Left - D(8) - D(34), D(15), D(34), btnH);
+            bpmBox.SetBounds(bpmUnit.Left - D(4) - D(68), D(15), D(68), btnH);
+            arrDd.SetBounds(bpmBox.Left - D(10) - D(170), D(15), D(170), btnH);
             int headRight = arrDd.Visible ? arrDd.Left : bpmBox.Left;
             titleLbl.SetBounds(m - D(2), D(7), Math.Max(D(100), headRight - m - D(16)), D(26));
             fileLbl.SetBounds(m, D(32), Math.Max(D(100), headRight - m - D(16)), D(18));
@@ -2291,8 +3141,10 @@ namespace FlpToVideo
             // channels column
             int leftW = D(LEFT);
             chCard.SetBounds(m, top, leftW, bodyH);
-            noneBtn.SetBounds(leftW - pad - D(40) + D(8), D(6), D(40), D(24));
-            allBtn.SetBounds(noneBtn.Left - D(2) - D(30), D(6), D(30), D(24));
+            int noneW = Math.Max(D(40), TextWidth(noneBtn.Text) + D(16));
+            int allW = Math.Max(D(30), TextWidth(allBtn.Text) + D(16));
+            noneBtn.SetBounds(leftW - pad - noneW + D(8), D(6), noneW, D(24));
+            allBtn.SetBounds(noneBtn.Left - D(2) - allW, D(6), allW, D(24));
             chList.SetBounds(D(4), D(TOP), leftW - D(8), bodyH - D(TOP) - D(6));
 
             // tabbed column
@@ -2309,42 +3161,52 @@ namespace FlpToVideo
             clipVal.SetBounds(valX, y, pw - valX - pad, row);
             y += D(PITCH);
             startKey.SetBounds(pad, y, key, row);
-            startSeg.SetBounds(valX, y, D(270), row);
+            int startW = Math.Max(D(280), MeasureSegWidth(startSeg, row));
+            startSeg.SetBounds(valX, y, startW, row);
             customBox.SetBounds(startSeg.Right + D(8), y, D(108), row);
             y += D(PITCH);
             destKey.SetBounds(pad, y, key, row);
-            destSeg.SetBounds(valX, y, D(230), row);
-            audioKey.SetBounds(destSeg.Right + D(18), y, D(44), row);
+            int destW = Math.Max(D(240), MeasureSegWidth(destSeg, row));
+            destSeg.SetBounds(valX, y, destW, row);
+            audioKey.SetBounds(destSeg.Right + D(16), y, Math.Max(D(44), TextWidth(audioKey.Text) + D(8)), row);
             audioToggle.SetBounds(audioKey.Right + D(4), y + (row - D(18)) / 2, D(34), D(18));
+            y += D(PITCH);
+            opKey.SetBounds(pad, y, key, row);
+            opToggle.SetBounds(valX, y + (row - D(18)) / 2, D(34), D(18));
+            int tmW = Math.Max(D(120), TextWidth(trackMotionBtn.Text) + D(28));
+            trackMotionBtn.SetBounds(opToggle.Right + D(16), y, tmW, row);
+            y += D(PITCH);
 
             // timing
             bool steps = song != null && SongHas(true), muted = song != null && song.HasMuted, notes = song != null && HasNotes();
             y = D(12);
-            minDd.SetBounds(valX, y, D(104), row);
-            toLbl.SetBounds(minDd.Right, y, D(26), row);
-            maxDd.SetBounds(toLbl.Right, y, D(104), row);
+            minDd.SetBounds(valX, y, D(120), row);
+            toLbl.SetBounds(minDd.Right, y, D(28), row);
+            maxDd.SetBounds(toLbl.Right, y, D(120), row);
             y = RowAt(y, true, lenKey, minDd, toLbl, maxDd);
-            stepDd.SetBounds(valX, y, D(150), row);
+            stepDd.SetBounds(valX, y, D(170), row);
             y = RowAt(y, steps, stepKey, stepDd);
-            longSeg.SetBounds(valX, y, D(222), row);
-            opKey.SetBounds(longSeg.Right + D(10), y, D(60), row);
-            opToggle.SetBounds(opKey.Right + D(6), y + (row - D(18)) / 2, D(34), D(18));
-            y = RowAt(y, true, longKey, longSeg, opKey, opToggle);
-            mutedSeg.SetBounds(valX, y, D(150), row);
+            int longW = Math.Max(D(240), MeasureSegWidth(longSeg, row));
+            longSeg.SetBounds(valX, y, longW, row);
+            y = RowAt(y, true, longKey, longSeg);
+            int mutedW = Math.Max(D(160), MeasureSegWidth(mutedSeg, row));
+            mutedSeg.SetBounds(valX, y, mutedW, row);
             mutedHint.SetBounds(mutedSeg.Right + D(12), y, Math.Max(D(40), pw - mutedSeg.Right - D(12) - pad), row);
             RowAt(y, muted, mutedKey, mutedSeg, mutedHint);
 
             // notes
             bool posed = slideSeg.Value == Planner.SlidePop || slideSeg.Value == Planner.SlideToggle;
             y = D(12);
-            slideSeg.SetBounds(valX, y, D(300), row);
-            easeKey.SetBounds(slideSeg.Right + D(8), y, D(40), row);
+            int slideW = Math.Max(D(320), MeasureSegWidth(slideSeg, row));
+            slideSeg.SetBounds(valX, y, slideW, row);
+            easeKey.SetBounds(slideSeg.Right + D(8), y, Math.Max(D(40), TextWidth(easeKey.Text) + D(6)), row);
             easeBox.SetBounds(easeKey.Right + D(4), y, D(60), row);
             easeUnit.SetBounds(easeBox.Right + D(4), y, D(24), row);
             y = RowAt(y, notes, slideKey, slideSeg, easeKey, easeBox, easeUnit);
             easeKey.Visible = easeBox.Visible = easeUnit.Visible = notes && posed;
-            pitchSeg.SetBounds(valX, y, D(222), row);
-            rootKey.SetBounds(pitchSeg.Right + D(10), y, D(46), row);
+            int pitchW = Math.Max(D(240), MeasureSegWidth(pitchSeg, row));
+            pitchSeg.SetBounds(valX, y, pitchW, row);
+            rootKey.SetBounds(pitchSeg.Right + D(10), y, Math.Max(D(46), TextWidth(rootKey.Text) + D(6)), row);
             rootDd.SetBounds(rootKey.Right + D(6), y, D(82), row);
             y = RowAt(y, notes, pitchKey, pitchSeg, rootKey, rootDd);
             poseKey.SetBounds(pad, y + D(4), key, row);
@@ -2365,9 +3227,11 @@ namespace FlpToVideo
             fxPanel.SetBounds(D(8), D(48), pw - D(16), Math.Max(D(40), ph - D(56)));
             LayoutRows();
 
-            // footer
-            goBtn.SetBounds(W - m - D(132), H - D(FOOT) + D(12), D(132), D(34));
-            cancelBtn.SetBounds(goBtn.Left - D(8) - D(92), goBtn.Top, D(92), D(34));
+            // footer — width follows translated label text
+            int goW = Math.Max(D(100), TextWidth(goBtn.Text) + D(36));
+            int cancelW = Math.Max(D(80), TextWidth(cancelBtn.Text) + D(28));
+            goBtn.SetBounds(W - m - goW, H - D(FOOT) + D(12), goW, D(34));
+            cancelBtn.SetBounds(goBtn.Left - D(8) - cancelW, goBtn.Top, cancelW, D(34));
             summaryLbl.SetBounds(m, H - D(FOOT) + D(18), Math.Max(D(50), cancelBtn.Left - m - D(16)), D(22));
         }
 
@@ -2492,7 +3356,7 @@ namespace FlpToVideo
             audioToggle.Enabled = anyAudio;
             tips.SetToolTip(audioToggle, !anyAudio ? "The clip has no audio grouped with it." :
                 audioToggle.Checked ? "Copies the clip's audio too, grouped, on a track below each video track." : "Video only.");
-            tips.SetToolTip(destSeg, destSeg.Value == 0 ? "One video track per channel, above the clip." :
+            tips.SetToolTip(destSeg, destSeg.Value == 0 ? "Sunviz creates separate video tracks at the top of the timeline." :
                 targetTrack != null ? "Everything on “" + targetName + "”." : "Select a video track first.");
 
             tips.SetToolTip(stepDd, stepDd.Value == Planner.StepUntilNext ? "Each step lasts until the channel's next hit." :
@@ -2503,11 +3367,49 @@ namespace FlpToVideo
                 slideSeg.Value == Planner.SlidePop ? "Pop: at each slide the picture jumps to the slide pose, then eases back." :
                 "Toggle: each slide switches the slide pose on or off, and the state carries on to the next clips.");
             tips.SetToolTip(easeBox, slideSeg.Value == Planner.SlidePop ? "How long a pop takes to settle back." : "How long the switch takes. 0 = instant.");
-            tips.SetToolTip(longSeg, LongHints[Math.Max(0, Math.Min(2, longSeg.Value))]);
-            tips.SetToolTip(opToggle, opToggle.Checked ? "Opacity follows velocity (loudest note in each channel = 100%)." : "Every clip at full opacity.");
-            tips.SetToolTip(pitchSeg, pitchSeg.Value == Planner.PitchShift ? "Shift: the audio is pitched (±24 semitones); clip speed and length stay as they are." :
-                pitchSeg.Value == Planner.PitchResample ? "Resample: each clip plays faster or slower to reach its note, video and audio together (like a sampler)." :
-                "Off: every clip plays as recorded.");
+            int lang = languageDd == null ? 0 : Math.Max(0, Math.Min(2, languageDd.Value));
+            string[] longHintsRu = {
+                "Продлить: клип продолжает играть после своего конца.",
+                "Заморозить: клип удерживает последний кадр.",
+                "Растянуть: клип замедляется, чтобы заполнить ноту."
+            };
+            string[] longHintsEs = {
+                "Extender: el clip sigue reproduciéndose tras su final.",
+                "Congelar: el clip mantiene su último fotograma.",
+                "Estirar: el clip se ralentiza para llenar la nota."
+            };
+            int li = Math.Max(0, Math.Min(2, longSeg.Value));
+            tips.SetToolTip(longSeg, lang == 1 ? longHintsRu[li] : lang == 2 ? longHintsEs[li] : LongHints[li]);
+            if (opToggle.Checked)
+                tips.SetToolTip(opToggle, lang == 1
+                    ? "Прозрачность следует velocity (самая громкая нота канала = 100%)."
+                    : lang == 2
+                    ? "La opacidad sigue la velocity (la nota más fuerte del canal = 100%)."
+                    : "Opacity follows velocity (loudest note in each channel = 100%).");
+            else
+                tips.SetToolTip(opToggle, lang == 1
+                    ? "Все клипы на 100% непрозрачности, без изменений по паттерну."
+                    : lang == 2
+                    ? "Todos los clips al 100% de opacidad, sin cambios por el patrón."
+                    : "Every clip at full opacity.");
+            if (pitchSeg.Value == Planner.PitchShift)
+                tips.SetToolTip(pitchSeg, lang == 1
+                    ? "Сдвиг: аудио транспонируется (±24 полутона); скорость и длина клипа не меняются."
+                    : lang == 2
+                    ? "Desplazar: el audio se transpón (±24 semitonos); velocidad y duración no cambian."
+                    : "Shift: the audio is pitched (±24 semitones); clip speed and length stay as they are.");
+            else if (pitchSeg.Value == Planner.PitchResample)
+                tips.SetToolTip(pitchSeg, lang == 1
+                    ? "Ресэмпл: клип ускоряется/замедляется до ноты (видео и аудио вместе)."
+                    : lang == 2
+                    ? "Remuestrear: el clip va más rápido o lento hasta la nota (vídeo y audio juntos)."
+                    : "Resample: each clip plays faster or slower to reach its note, video and audio together (like a sampler).");
+            else
+                tips.SetToolTip(pitchSeg, lang == 1
+                    ? "Выкл: каждый клип играет как записан."
+                    : lang == 2
+                    ? "Apagado: cada clip se reproduce tal cual."
+                    : "Off: every clip plays as recorded.");
 
             if (song != null && song.HasMuted)
             {
@@ -2586,7 +3488,7 @@ namespace FlpToVideo
                     if (matched.TryGetValue(p, out c)) j.Sources[p] = c;
                 }
             j.StartMs = startSeg.Value == 0 ? 0 : startSeg.Value == 1 ? cursorMs : customBox.Milliseconds;
-            j.NewTracks = destSeg.Value == 0;
+            j.NewTracks = true; // Sunviz always creates dedicated tracks at the top of the timeline.
             j.Target = targetTrack;
             j.MinLen = minDd.Value;
             j.MaxLen = maxDd.Value;
@@ -2600,6 +3502,7 @@ namespace FlpToVideo
             j.Audio = audioToggle.Checked && audioToggle.Enabled;
             j.LongMode = longSeg.Value;
             j.Velocity = opToggle.Checked;
+            j.TrackMotion = trackMotionSpec != null ? trackMotionSpec.Clone() : new TrackMotionSpec();
             bool retimed = bpmBox.Value > 0 && Math.Abs(bpmBox.Value - bpmShown) > 1e-9;
             j.Scale = retimed ? bpmShown / bpmBox.Value : 1;
             foreach (EffectSpec e in effects) j.Effects.Add(e.Clone());
@@ -2626,6 +3529,7 @@ namespace FlpToVideo
             st.MaxLen = maxDd.Value;
             st.LongMode = longSeg.Value;
             st.Velocity = opToggle.Checked;
+            st.TrackMotion = trackMotionSpec != null ? trackMotionSpec.Clone() : new TrackMotionSpec();
             st.Preset = presetDd.Value >= 0 ? presetDd.Items[presetDd.Value] : "";
             st.Checked.Clear();
             for (int i = 0; i < picked.Length; i++) if (picked[i]) st.Checked.Add(song.Parts[i].Id);
@@ -2636,6 +3540,33 @@ namespace FlpToVideo
                 st.WinW = (int)Math.Round(ClientSize.Width / Theme.S);
                 st.WinH = (int)Math.Round(ClientSize.Height / Theme.S);
             }
+        }
+
+        void OpenTrackMotion()
+        {
+            int lang = languageDd == null ? 0 : Math.Max(0, Math.Min(2, languageDd.Value));
+            int fw = FrameRef.Width > 0 ? FrameRef.Width : 1920;
+            int fh = FrameRef.Height > 0 ? FrameRef.Height : 1080;
+            using (TrackMotionForm dlg = new TrackMotionForm(trackMotionSpec, fw, fh, lang))
+            {
+                if (dlg.ShowDialog(this) == DialogResult.OK)
+                {
+                    trackMotionSpec = dlg.Result.Clone();
+                    UpdateTrackMotionButton();
+                }
+            }
+        }
+
+        void UpdateTrackMotionButton()
+        {
+            if (trackMotionBtn == null) return;
+            int lang = languageDd == null ? 0 : Math.Max(0, Math.Min(2, languageDd.Value));
+            string baseName = lang == 1 ? "Track Motion…" : lang == 2 ? "Track Motion…" : "Track Motion…";
+            if (trackMotionSpec != null && trackMotionSpec.Enabled)
+                trackMotionBtn.Text = baseName.TrimEnd('…', '.') + " ●";
+            else
+                trackMotionBtn.Text = baseName;
+            try { DoLayout(); } catch { }
         }
 
         // ---------------------------------------------------------------- effects list
@@ -2663,11 +3594,12 @@ namespace FlpToVideo
 
         void ShowAddMenu()
         {
+            int lang = languageDd == null ? 0 : Math.Max(0, Math.Min(2, languageDd.Value));
             ContextMenuStrip menu = Theme.MakeMenu();
             for (int g = 0; g < FxInfo.Groups.Length; g++)
             {
                 if (g > 0) menu.Items.Add(new ToolStripSeparator());
-                ToolStripLabel head = new ToolStripLabel(FxInfo.GroupNames[g]);
+                ToolStripLabel head = new ToolStripLabel(TrGroup(FxInfo.GroupNames[g], lang));
                 head.Font = Theme.Caption;
                 head.ForeColor = Theme.Faint;
                 head.Padding = new Padding(D(4), D(4), 0, 0);
@@ -2677,9 +3609,9 @@ namespace FlpToVideo
                     Fx t = type;
                     bool used = false;
                     foreach (EffectSpec e in effects) if (e.Type == t) used = true;
-                    ToolStripMenuItem item = new ToolStripMenuItem(FxInfo.Name(t));
+                    ToolStripMenuItem item = new ToolStripMenuItem(TrFxName(t, lang));
                     item.Enabled = !used;
-                    item.ShortcutKeyDisplayString = used ? "already added" : FxInfo.Short(t);
+                    item.ShortcutKeyDisplayString = used ? Tr("already added", lang) : TrFxShort(t, lang);
                     item.ShowShortcutKeys = true;
                     item.Padding = new Padding(D(6), D(3), D(6), D(3));
                     item.Click += delegate
@@ -2695,6 +3627,75 @@ namespace FlpToVideo
             menu.ShowItemToolTips = false;
             menu.Closed += delegate { BeginInvoke(new MethodInvoker(menu.Dispose)); };
             menu.Show(addFxBtn, new Point(0, addFxBtn.Height + D(2)));
+        }
+
+        static string Tr(string en, int lang)
+        {
+            if (lang <= 0) return en;
+            // minimal inline map for menu strings
+            if (en == "already added") return lang == 1 ? "уже добавлено" : "ya añadido";
+            return en;
+        }
+
+        static string TrGroup(string en, int lang)
+        {
+            if (lang <= 0) return en;
+            if (en == "MOTION") return lang == 1 ? "ДВИЖЕНИЕ" : "MOVIMIENTO";
+            if (en == "COLOR") return lang == 1 ? "ЦВЕТ" : "COLOR";
+            if (en == "LIGHT & TIME") return lang == 1 ? "СВЕТ И ВРЕМЯ" : "LUZ Y TIEMPO";
+            return en;
+        }
+
+        static string TrFxName(Fx t, int lang)
+        {
+            if (lang <= 0) return FxInfo.Name(t);
+            string en = FxInfo.Name(t);
+            string[] ru = null, es = null;
+            switch (t)
+            {
+                case Fx.PanCrop: ru = new[] { "Pan/Crop" }; es = new[] { "Pan/Crop" }; break;
+                case Fx.Zoom: ru = new[] { "Масштаб" }; es = new[] { "Zoom" }; break;
+                case Fx.Rotate: ru = new[] { "Поворот" }; es = new[] { "Rotar" }; break;
+                case Fx.Move: ru = new[] { "Сдвиг" }; es = new[] { "Mover" }; break;
+                case Fx.Flip: ru = new[] { "Отражение" }; es = new[] { "Voltear" }; break;
+                case Fx.Hue: ru = new[] { "Оттенок" }; es = new[] { "Tono" }; break;
+                case Fx.HueSteps: ru = new[] { "Шаги оттенка" }; es = new[] { "Pasos de tono" }; break;
+                case Fx.Saturation: ru = new[] { "Насыщенность" }; es = new[] { "Saturación" }; break;
+                case Fx.Contrast: ru = new[] { "Контраст" }; es = new[] { "Contraste" }; break;
+                case Fx.Negative: ru = new[] { "Негатив" }; es = new[] { "Negativo" }; break;
+                case Fx.Greyscale: ru = new[] { "Ч/б" }; es = new[] { "Escala grises" }; break;
+                case Fx.Flash: ru = new[] { "Вспышка" }; es = new[] { "Flash" }; break;
+                case Fx.Fade: ru = new[] { "Затухание" }; es = new[] { "Fundido" }; break;
+                case Fx.Blur: ru = new[] { "Размытие" }; es = new[] { "Desenfoque" }; break;
+                case Fx.Reverse: ru = new[] { "Реверс" }; es = new[] { "Reversa" }; break;
+            }
+            if (lang == 1 && ru != null) return ru[0];
+            if (lang == 2 && es != null) return es[0];
+            return en;
+        }
+
+        static string TrFxShort(Fx t, int lang)
+        {
+            if (lang <= 0) return FxInfo.Short(t);
+            switch (t)
+            {
+                case Fx.PanCrop: return lang == 1 ? "ключевые кадры, как Pan/Crop" : "fotogramas clave, como Pan/Crop";
+                case Fx.Zoom: return lang == 1 ? "масштаб на каждую ноту" : "escala en cada nota";
+                case Fx.Rotate: return lang == 1 ? "поворот на каждую ноту" : "giro en cada nota";
+                case Fx.Move: return lang == 1 ? "сдвиг на каждую ноту" : "desplazamiento en cada nota";
+                case Fx.Flip: return lang == 1 ? "отражение по нотам" : "volteo por nota";
+                case Fx.Fade: return lang == 1 ? "затухание клипа" : "fundido de cada clip";
+                case Fx.Flash: return lang == 1 ? "вспышка с затуханием" : "destello que se desvanece";
+                case Fx.Hue: return lang == 1 ? "сдвиг оттенка" : "barrido de tono";
+                case Fx.HueSteps: return lang == 1 ? "новый цвет на ноту" : "nuevo color por nota";
+                case Fx.Saturation: return lang == 1 ? "насыщенность по нотам" : "saturación por nota";
+                case Fx.Contrast: return lang == 1 ? "контраст по нотам" : "contraste por nota";
+                case Fx.Blur: return lang == 1 ? "размытие по нотам" : "desenfoque por nota";
+                case Fx.Negative: return lang == 1 ? "негатив по паттерну" : "negativo por patrón";
+                case Fx.Greyscale: return lang == 1 ? "ч/б по паттерну" : "b/n por patrón";
+                case Fx.Reverse: return lang == 1 ? "реверс по паттерну" : "reverso por patrón";
+            }
+            return FxInfo.Short(t);
         }
 
         // ---------------------------------------------------------------- presets
@@ -2749,6 +3750,930 @@ namespace FlpToVideo
             catch (Exception ex) { Ui.Warn(this, "Couldn't delete the preset.\n\n" + ex.Message); }
             RefreshPresets(null);
         }
+    }
+
+    // =========================================================================================
+    //  Track Motion editor (Sunviz-themed, applies via VEGAS TrackMotion API)
+    // =========================================================================================
+
+    internal sealed class TrackMotionForm : Form
+    {
+        readonly int frameW, frameH, lang;
+        readonly TrackMotionSpec work;
+        readonly List<string> presetNames = new List<string>();
+        NumBox xBox, yBox, wBox, hBox, angBox, rotBox, offXBox, offYBox;
+        NumBox shX, shY, shBlur, shAlpha, shW, shH;
+        Toggle enableToggle, shadowToggle;
+        Dropdown presetDd;
+        WorkspaceView workspace;
+        Btn okBtn, cancelBtn, resetBtn, savePresetBtn, delPresetBtn;
+        Label titleLbl;
+        Segmented modeTabs; // Position | 2D Shadow
+        int mode; // 0 position, 1 shadow
+        bool snapOn = true, lockAspect, preventMove, preventScale, scaleAboutCenter = true, gridMoveOn, rotationOn = true;
+        double gridSpacing = 8, rotSnap = 5;
+        NumBox gridColsBox, gridRowsBox;
+        Dropdown layoutGridDd;
+        Btn fitGridBtn, snapGridBtn;
+        NumBox gridBox, rotSnapBox;
+        Toggle snapToggle, lockAspectToggle, preventMoveToggle, preventScaleToggle, scaleCenterToggle, gridMoveToggle, rotationToggle;
+
+        static string PresetDir
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Sunviz", "trackmotion"); }
+        }
+
+        public TrackMotionSpec Result { get { return work; } }
+
+        public TrackMotionForm(TrackMotionSpec src, int frameW, int frameH, int lang)
+        {
+            this.frameW = frameW > 0 ? frameW : 1920;
+            this.frameH = frameH > 0 ? frameH : 1080;
+            this.lang = lang;
+            work = src != null ? src.Clone() : new TrackMotionSpec();
+            // 2D Shadow was removed from Track Motion. Ignore any legacy saved shadow values.
+            work.Shadow = false;
+            if (work.Width < 2) work.Width = this.frameW;
+            if (work.Height < 2) work.Height = this.frameH;
+
+            Text = T("Track Motion", "Track Motion", "Track Motion");
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = true;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.CenterParent;
+            BackColor = Theme.Bg;
+            ForeColor = Theme.Text;
+            Font = Theme.Base;
+            MinimumSize = new Size(Theme.D(820), Theme.D(560));
+            ClientSize = new Size(Theme.D(960), Theme.D(640));
+            DoubleBuffered = true;
+
+            // Top bar: enable + presets
+            enableToggle = new Toggle();
+            enableToggle.Checked = work.Enabled;
+            enableToggle.Changed += delegate { work.Enabled = enableToggle.Checked; workspace.Invalidate(); };
+            Controls.Add(enableToggle);
+
+            LoadPresetList();
+            presetDd = new Dropdown(presetNames.ToArray());
+            if (presetNames.Count > 0)
+            {
+                int ix = presetNames.IndexOf(work.Preset ?? "");
+                presetDd.SetValueSilently(ix >= 0 ? ix : 0);
+            }
+            presetDd.Changed += delegate { if (presetDd.Value >= 0) LoadPreset(presetNames[presetDd.Value]); };
+            Controls.Add(presetDd);
+
+            savePresetBtn = new Btn(T("Save", "Сохр.", "Guardar"), BtnKind.Secondary);
+            savePresetBtn.Click += delegate { SavePreset(); };
+            Controls.Add(savePresetBtn);
+            delPresetBtn = new Btn(T("Delete", "Удал.", "Eliminar"), BtnKind.Secondary);
+            delPresetBtn.Click += delegate { DeletePreset(); };
+            Controls.Add(delPresetBtn);
+
+            // Track Motion editor intentionally exposes position/scale/rotation only.
+            // 2D Shadow is not supported reliably by the VEGAS TrackMotion API.
+            modeTabs = new Segmented(T("Position", "Позиция", "Posición"));
+            mode = 0; modeTabs.Value = 0;
+            modeTabs.Changed += delegate { mode = 0; LayoutForm(); workspace.Invalidate(); };
+            Controls.Add(modeTabs);
+
+            // Numeric fields
+            xBox = MkNum(work.X, -20000, 20000, 1, 1, delegate { work.X = xBox.Value; workspace.Invalidate(); });
+            yBox = MkNum(work.Y, -20000, 20000, 1, 1, delegate { work.Y = yBox.Value; workspace.Invalidate(); });
+            wBox = MkNum(work.Width, 1, 40000, 1, 1, delegate { work.Width = wBox.Value; workspace.Invalidate(); });
+            hBox = MkNum(work.Height, 1, 40000, 1, 1, delegate { work.Height = hBox.Value; workspace.Invalidate(); });
+            angBox = MkNum(work.Angle, -360, 360, 0.1, 1, delegate { work.Angle = angBox.Value; workspace.Invalidate(); });
+            rotBox = MkNum(work.RotZ, -360, 360, 0.1, 1, delegate { work.RotZ = rotBox.Value; workspace.Invalidate(); });
+            offXBox = MkNum(work.RotOffX, -20000, 20000, 1, 1, delegate { work.RotOffX = offXBox.Value; workspace.Invalidate(); });
+            offYBox = MkNum(work.RotOffY, -20000, 20000, 1, 1, delegate { work.RotOffY = offYBox.Value; workspace.Invalidate(); });
+
+            snapToggle = new Toggle(); snapToggle.Checked = true;
+            snapToggle.Changed += delegate { snapOn = snapToggle.Checked; };
+            Controls.Add(snapToggle);
+            lockAspectToggle = new Toggle();
+            lockAspectToggle.Changed += delegate { lockAspect = lockAspectToggle.Checked; };
+            Controls.Add(lockAspectToggle);
+            preventMoveToggle = new Toggle();
+            preventMoveToggle.Changed += delegate { preventMove = preventMoveToggle.Checked; };
+            Controls.Add(preventMoveToggle);
+            preventScaleToggle = new Toggle();
+            preventScaleToggle.Changed += delegate { preventScale = preventScaleToggle.Checked; };
+            Controls.Add(preventScaleToggle);
+            scaleCenterToggle = new Toggle(); scaleCenterToggle.Checked = true;
+            scaleCenterToggle.Changed += delegate { scaleAboutCenter = scaleCenterToggle.Checked; };
+            Controls.Add(scaleCenterToggle);
+            gridMoveToggle = new Toggle(); gridMoveToggle.Checked = false;
+            gridMoveToggle.Changed += delegate { gridMoveOn = gridMoveToggle.Checked; };
+            Controls.Add(gridMoveToggle);
+            rotationToggle = new Toggle(); rotationToggle.Checked = work.RotationEnabled;
+            rotationToggle.Changed += delegate { rotationOn = rotationToggle.Checked; work.RotationEnabled = rotationOn; angBox.Enabled = rotationOn; rotBox.Enabled = rotationOn; offXBox.Enabled = rotationOn; offYBox.Enabled = rotationOn; workspace.Invalidate(); };
+            Controls.Add(rotationToggle);
+            angBox.Enabled = rotBox.Enabled = offXBox.Enabled = offYBox.Enabled = rotationOn;
+            gridBox = MkNum(8, 1, 200, 1, 0, delegate { gridSpacing = Math.Max(1, gridBox.Value); workspace.Invalidate(); });
+            rotSnapBox = MkNum(5, 0, 90, 1, 0, delegate { rotSnap = Math.Max(0, rotSnapBox.Value); });
+
+            string[] gridPresets = new string[] {
+                "1 × 1", "2 × 2", "3 × 3", "4 × 4", "5 × 5", "6 × 6",
+                "1 × 2", "2 × 1", "2 × 3", "3 × 2", "3 × 4", "4 × 3",
+                T("Custom…", "Своя…", "Personalizada…")
+            };
+            layoutGridDd = new Dropdown(gridPresets);
+            // select matching preset
+            {
+                string cur = work.GridCols + " × " + work.GridRows;
+                int gix = Array.IndexOf(gridPresets, cur.Replace("×", "×")); // same
+                // manual match
+                gix = -1;
+                for (int gi = 0; gi < gridPresets.Length - 1; gi++)
+                {
+                    string[] parts = gridPresets[gi].Split(new char[] { '×', 'x', 'X' });
+                    if (parts.Length == 2)
+                    {
+                        int c, r;
+                        if (int.TryParse(parts[0].Trim(), out c) && int.TryParse(parts[1].Trim(), out r)
+                            && c == work.GridCols && r == work.GridRows) { gix = gi; break; }
+                    }
+                }
+                layoutGridDd.SetValueSilently(gix >= 0 ? gix : gridPresets.Length - 1);
+            }
+            layoutGridDd.Changed += delegate { ApplyLayoutGridPreset(); };
+            Controls.Add(layoutGridDd);
+            gridColsBox = MkNum(Math.Max(1, work.GridCols), 1, 32, 1, 0, delegate {
+                work.GridCols = Math.Max(1, (int)Math.Round(gridColsBox.Value));
+                workspace.Invalidate();
+            });
+            gridRowsBox = MkNum(Math.Max(1, work.GridRows), 1, 32, 1, 0, delegate {
+                work.GridRows = Math.Max(1, (int)Math.Round(gridRowsBox.Value));
+                workspace.Invalidate();
+            });
+            fitGridBtn = new Btn(T("Fit cell", "В ячейку", "A celda"), BtnKind.Secondary);
+            fitGridBtn.Click += delegate { FitToNearestCell(); };
+            Controls.Add(fitGridBtn);
+            snapGridBtn = new Btn(T("Snap to grid", "К сетке", "A la cuadrícula"), BtnKind.Secondary);
+            snapGridBtn.Click += delegate { SnapBoxToGrid(); };
+            Controls.Add(snapGridBtn);
+
+            shadowToggle = new Toggle();
+            shadowToggle.Checked = work.Shadow;
+            shadowToggle.Changed += delegate { work.Shadow = shadowToggle.Checked; workspace.Invalidate(); };
+            Controls.Add(shadowToggle);
+            shX = MkNum(work.ShadowX, -2000, 2000, 1, 1, delegate { work.ShadowX = shX.Value; workspace.Invalidate(); });
+            shY = MkNum(work.ShadowY, -2000, 2000, 1, 1, delegate { work.ShadowY = shY.Value; workspace.Invalidate(); });
+            shBlur = MkNum(work.ShadowBlur, 0, 200, 1, 0, delegate { work.ShadowBlur = shBlur.Value; });
+            shAlpha = MkNum(work.ShadowAlpha, 0, 100, 1, 0, delegate { work.ShadowAlpha = shAlpha.Value; workspace.Invalidate(); });
+            shW = MkNum(work.ShadowWidth, 1, 40000, 1, 1, delegate { work.ShadowWidth = shW.Value; workspace.Invalidate(); });
+            shH = MkNum(work.ShadowHeight, 1, 40000, 1, 1, delegate { work.ShadowHeight = shH.Value; workspace.Invalidate(); });
+
+            workspace = new WorkspaceView(this);
+            Controls.Add(workspace);
+
+            resetBtn = new Btn(T("Reset", "Сброс", "Restablecer"), BtnKind.Secondary);
+            resetBtn.Click += delegate { ResetFull(); };
+            Controls.Add(resetBtn);
+            cancelBtn = new Btn(T("Cancel", "Отмена", "Cancelar"), BtnKind.Secondary);
+            cancelBtn.DialogResult = DialogResult.Cancel;
+            Controls.Add(cancelBtn);
+            okBtn = new Btn(T("Apply", "Применить", "Aplicar"), BtnKind.Primary);
+            okBtn.DialogResult = DialogResult.OK;
+            Controls.Add(okBtn);
+            AcceptButton = okBtn;
+            CancelButton = cancelBtn;
+
+            Resize += delegate { LayoutForm(); };
+            LayoutForm();
+            try { Native.DarkTitleBar(Handle); } catch { }
+        }
+
+        NumBox MkNum(double v, double lo, double hi, double step, int dec, MethodInvoker onChange)
+        {
+            NumBox n = new NumBox(v, lo, hi, step, dec);
+            n.ValueChanged += delegate { onChange(); };
+            Controls.Add(n);
+            return n;
+        }
+
+        string T(string en, string ru, string es) { return lang == 1 ? ru : lang == 2 ? es : en; }
+
+        void LayoutForm()
+        {
+            int m = Theme.D(12), row = Theme.D(26), gap = Theme.D(6);
+            int leftW = Theme.D(240);
+            int y = m;
+
+            // top strip
+            enableToggle.SetBounds(m, y + (row - Theme.D(18)) / 2, Theme.D(34), Theme.D(18));
+            Label en = EnsureLabel("en", T("Enabled", "Включено", "Activado"));
+            en.SetBounds(enableToggle.Right + Theme.D(6), y, Theme.D(90), row);
+            Label pr = EnsureLabel("pr", T("Preset", "Пресет", "Preajuste"));
+            pr.SetBounds(en.Right + Theme.D(12), y, Theme.D(55), row);
+            presetDd.SetBounds(pr.Right + Theme.D(4), y, Theme.D(200), row);
+            savePresetBtn.SetBounds(presetDd.Right + Theme.D(6), y, Theme.D(72), row);
+            delPresetBtn.SetBounds(savePresetBtn.Right + Theme.D(4), y, Theme.D(72), row);
+            y += row + gap;
+
+            modeTabs.SetBounds(m, y, Theme.D(220), row);
+            y += row + gap;
+
+            // tool row: snap / locks
+            int tx = m;
+            PlaceTool(snapToggle, T("Snap", "Привязка", "Ajuste"), ref tx, y, row);
+            PlaceTool(lockAspectToggle, T("Aspect", "Пропорции", "Proporción"), ref tx, y, row);
+            PlaceTool(preventMoveToggle, T("Lock move", "Блок. движ.", "Bloq. mov."), ref tx, y, row);
+            PlaceTool(preventScaleToggle, T("Lock scale", "Блок. масшт.", "Bloq. escala"), ref tx, y, row);
+            PlaceTool(scaleCenterToggle, T("Scale center", "Масшт. от центра", "Escala centro"), ref tx, y, row);
+            y += row + gap;
+            tx = m;
+            PlaceTool(gridMoveToggle, T("Grid movement", "Движение по сетке", "Mover en cuadrícula"), ref tx, y, row);
+            PlaceTool(rotationToggle, T("Rotation", "Вращение", "Rotación"), ref tx, y, row);
+            y += row + gap;
+            Label gs = EnsureLabel("gridsp", T("Grid spacing", "Шаг сетки", "Espaciado"));
+            gs.SetBounds(m, y, Theme.D(100), row);
+            gridBox.SetBounds(m + Theme.D(104), y, Theme.D(60), row);
+            Label rs = EnsureLabel("rotsnap", T("Rot. snap °", "Привяз. °", "Ajuste °"));
+            rs.SetBounds(gridBox.Right + Theme.D(12), y, Theme.D(90), row);
+            rotSnapBox.SetBounds(rs.Right + Theme.D(4), y, Theme.D(50), row);
+            y += row + gap;
+
+            Label lg = EnsureLabel("layoutgrid", T("Layout grid", "Сетка", "Cuadrícula"));
+            lg.SetBounds(m, y, Theme.D(90), row);
+            layoutGridDd.SetBounds(lg.Right + Theme.D(4), y, Theme.D(110), row);
+            Label cx = EnsureLabel("gcols", "C");
+            cx.SetBounds(layoutGridDd.Right + Theme.D(6), y, Theme.D(14), row);
+            gridColsBox.SetBounds(cx.Right, y, Theme.D(44), row);
+            Label rx = EnsureLabel("grows", "R");
+            rx.SetBounds(gridColsBox.Right + Theme.D(4), y, Theme.D(14), row);
+            gridRowsBox.SetBounds(rx.Right, y, Theme.D(44), row);
+            y += row + gap;
+            fitGridBtn.SetBounds(m, y, Theme.D(100), row);
+            snapGridBtn.SetBounds(fitGridBtn.Right + Theme.D(6), y, Theme.D(110), row);
+            y += row + gap;
+
+            int panelTop = y;
+            int fieldY = panelTop;
+            bool pos = true;
+
+            // show/hide groups
+            SetVis(pos, xBox, yBox, wBox, hBox, angBox, rotBox, offXBox, offYBox);
+            SetVis(false, shadowToggle, shX, shY, shBlur, shAlpha, shW, shH);
+
+            if (pos)
+            {
+                fieldY = Field(T("Position", "Позиция", "Posición"), null, m, fieldY, row, true);
+                fieldY = Field("X", xBox, m, fieldY, row, false);
+                fieldY = Field("Y", yBox, m, fieldY, row, false);
+                fieldY = Field(T("Width", "Ширина", "Ancho"), wBox, m, fieldY, row, false);
+                fieldY = Field(T("Height", "Высота", "Alto"), hBox, m, fieldY, row, false);
+                fieldY += gap;
+                fieldY = Field(T("Orientation", "Ориентация", "Orientación"), null, m, fieldY, row, true);
+                fieldY = Field(T("Angle °", "Угол °", "Ángulo °"), angBox, m, fieldY, row, false);
+                fieldY += gap;
+                fieldY = Field(T("Rotation", "Вращение", "Rotación"), null, m, fieldY, row, true);
+                fieldY = Field(T("Angle °", "Угол °", "Ángulo °"), rotBox, m, fieldY, row, false);
+                fieldY = Field("X Offset", offXBox, m, fieldY, row, false);
+                fieldY = Field("Y Offset", offYBox, m, fieldY, row, false);
+            }
+
+            int by = ClientSize.Height - Theme.D(48);
+            workspace.SetBounds(leftW + m, panelTop, ClientSize.Width - leftW - m * 2, by - panelTop - Theme.D(8));
+
+            okBtn.SetBounds(ClientSize.Width - m - Theme.D(110), by, Theme.D(110), Theme.D(32));
+            cancelBtn.SetBounds(okBtn.Left - Theme.D(8) - Theme.D(100), by, Theme.D(100), Theme.D(32));
+            resetBtn.SetBounds(m, by, Theme.D(100), Theme.D(32));
+        }
+
+        void SetVis(bool vis, params Control[] cs)
+        {
+            foreach (Control c in cs) if (c != null) c.Visible = vis;
+        }
+
+        void PlaceTool(Toggle t, string label, ref int x, int y, int row)
+        {
+            t.SetBounds(x, y + (row - Theme.D(18)) / 2, Theme.D(34), Theme.D(18));
+            Label l = EnsureLabel("tool_" + label, label);
+            l.SetBounds(t.Right + Theme.D(4), y, Theme.D(88), row);
+            x = l.Right + Theme.D(10);
+        }
+
+        int Field(string label, NumBox box, int x, int y, int row, bool header)
+        {
+            Label l = EnsureLabel("f_" + label + (box != null ? box.GetHashCode().ToString() : "h"), label);
+            l.ForeColor = header ? Theme.Text : Theme.Dim;
+            l.Font = header ? Theme.Semi : Theme.Base;
+            if (box == null)
+            {
+                l.SetBounds(x, y, Theme.D(220), row);
+                return y + row + Theme.D(2);
+            }
+            l.SetBounds(x, y, Theme.D(100), row);
+            box.SetBounds(x + Theme.D(104), y, Theme.D(110), row);
+            box.Visible = true;
+            return y + row + Theme.D(4);
+        }
+
+        Label EnsureLabel(string key, string text)
+        {
+            foreach (Control c in Controls)
+            {
+                if (c is Label && object.Equals(c.Tag, key))
+                {
+                    c.Text = text;
+                    c.Visible = true;
+                    return (Label)c;
+                }
+            }
+            Label l = new Label();
+            l.Tag = key;
+            l.Text = text;
+            l.AutoSize = false;
+            l.TextAlign = ContentAlignment.MiddleLeft;
+            l.ForeColor = Theme.Dim;
+            Controls.Add(l);
+            return l;
+        }
+
+        void SyncBoxes()
+        {
+            xBox.Value = work.X; yBox.Value = work.Y;
+            wBox.Value = work.Width; hBox.Value = work.Height;
+            angBox.Value = work.Angle; rotBox.Value = work.RotZ;
+            offXBox.Value = work.RotOffX; offYBox.Value = work.RotOffY;
+            shadowToggle.Checked = work.Shadow;
+            shX.Value = work.ShadowX; shY.Value = work.ShadowY;
+            shW.Value = work.ShadowWidth; shH.Value = work.ShadowHeight;
+            shBlur.Value = work.ShadowBlur; shAlpha.Value = work.ShadowAlpha;
+            enableToggle.Checked = work.Enabled;
+            workspace.Invalidate();
+        }
+
+        void ResetFull()
+        {
+            work.Enabled = true;
+            work.X = 0; work.Y = 0;
+            work.Width = frameW; work.Height = frameH;
+            work.Angle = work.RotZ = work.RotOffX = work.RotOffY = 0;
+            work.Shadow = false;
+            work.ShadowX = 8; work.ShadowY = -8; work.ShadowBlur = 12; work.ShadowAlpha = 50;
+            work.ShadowWidth = work.Width; work.ShadowHeight = work.Height; work.RotationEnabled = true; rotationOn = true; rotationToggle.Checked = true;
+            SyncBoxes();
+        }
+
+        void LoadPresetList()
+        {
+            presetNames.Clear();
+            presetNames.Add(T("(Default)", "(По умолчанию)", "(Predeterminado)"));
+            try
+            {
+                Directory.CreateDirectory(PresetDir);
+                foreach (string f in Directory.GetFiles(PresetDir, "*.tm.txt"))
+                    presetNames.Add(Path.GetFileNameWithoutExtension(Path.GetFileNameWithoutExtension(f)));
+            }
+            catch { }
+        }
+
+        void LoadPreset(string name)
+        {
+            if (string.IsNullOrEmpty(name) || name.StartsWith("(")) { ResetFull(); return; }
+            try
+            {
+                string path = Path.Combine(PresetDir, name + ".tm.txt");
+                if (!File.Exists(path)) return;
+                TrackMotionSpec t = TrackMotionSpec.Parse(File.ReadAllText(path, Encoding.UTF8).Trim());
+                work.Enabled = t.Enabled;
+                work.X = t.X; work.Y = t.Y; work.Width = t.Width; work.Height = t.Height;
+                work.Angle = t.Angle; work.RotZ = t.RotZ; work.RotOffX = t.RotOffX; work.RotOffY = t.RotOffY;
+                work.Shadow = false; // legacy preset shadow data is intentionally ignored
+                work.RotationEnabled = t.RotationEnabled; rotationOn = t.RotationEnabled; rotationToggle.Checked = t.RotationEnabled; angBox.Enabled = rotBox.Enabled = offXBox.Enabled = offYBox.Enabled = t.RotationEnabled;
+                work.ShadowBlur = t.ShadowBlur; work.ShadowAlpha = t.ShadowAlpha;
+                work.Preset = name;
+                SyncBoxes();
+            }
+            catch (Exception ex) { Ui.Warn(this, ex.Message); }
+        }
+
+        void SavePreset()
+        {
+            string name = InputDialog.Ask(this, T("Save preset", "Сохранить пресет", "Guardar preajuste"),
+                T("Preset name", "Имя пресета", "Nombre"), work.Preset ?? "");
+            if (string.IsNullOrEmpty(name)) return;
+            try
+            {
+                Directory.CreateDirectory(PresetDir);
+                work.Preset = name;
+                File.WriteAllText(Path.Combine(PresetDir, name + ".tm.txt"), work.Serialize(), Encoding.UTF8);
+                LoadPresetList();
+                presetDd.Items.Clear();
+                presetDd.Items.AddRange(presetNames);
+                int ix = presetNames.IndexOf(name);
+                presetDd.SetValueSilently(ix >= 0 ? ix : 0);
+                presetDd.Invalidate();
+            }
+            catch (Exception ex) { Ui.Warn(this, ex.Message); }
+        }
+
+        void DeletePreset()
+        {
+            if (presetDd.Value <= 0) return;
+            string name = presetNames[presetDd.Value];
+            if (!Ui.Confirm(this, T("Delete preset?", "Удалить пресет?", "¿Eliminar preajuste?") + "\n" + name)) return;
+            try
+            {
+                string path = Path.Combine(PresetDir, name + ".tm.txt");
+                if (File.Exists(path)) File.Delete(path);
+                LoadPresetList();
+                presetDd.Items.Clear();
+                presetDd.Items.AddRange(presetNames);
+                presetDd.SetValueSilently(0);
+                presetDd.Invalidate();
+            }
+            catch (Exception ex) { Ui.Warn(this, ex.Message); }
+        }
+
+        /// <summary>Center-gizmo workspace like VEGAS Track Motion (drag center to move, not corner handles).</summary>
+
+        void ApplyLayoutGridPreset()
+        {
+            if (layoutGridDd == null || layoutGridDd.Value < 0) return;
+            string s = layoutGridDd.Items[layoutGridDd.Value];
+            if (s == null) return;
+            if (s.IndexOf("Custom", StringComparison.OrdinalIgnoreCase) >= 0
+                || s.IndexOf("Своя", StringComparison.OrdinalIgnoreCase) >= 0
+                || s.IndexOf("Personalizada", StringComparison.OrdinalIgnoreCase) >= 0)
+                return; // keep current cols/rows
+            string[] parts = s.Split(new char[] { '×', 'x', 'X' });
+            int c, r;
+            if (parts.Length == 2
+                && int.TryParse(parts[0].Trim(), out c)
+                && int.TryParse(parts[1].Trim(), out r)
+                && c >= 1 && r >= 1)
+            {
+                work.GridCols = c;
+                work.GridRows = r;
+                if (gridColsBox != null) gridColsBox.Value = c;
+                if (gridRowsBox != null) gridRowsBox.Value = r;
+                if (workspace != null) workspace.Invalidate();
+            }
+        }
+
+        /// <summary>Resize & center the box into the nearest layout-grid cell.</summary>
+        void FitToNearestCell()
+        {
+            int cols = Math.Max(1, work.GridCols);
+            int rows = Math.Max(1, work.GridRows);
+            double cellW = frameW / (double)cols;
+            double cellH = frameH / (double)rows;
+            // current center in frame coords (0,0 = frame center)
+            double cx = frameW / 2.0 + work.X;
+            double cy = frameH / 2.0 - work.Y;
+            int col = (int)Math.Floor(cx / cellW);
+            int row = (int)Math.Floor(cy / cellH);
+            if (col < 0) col = 0; if (col >= cols) col = cols - 1;
+            if (row < 0) row = 0; if (row >= rows) row = rows - 1;
+            double left = col * cellW;
+            double top = row * cellH;
+            work.Width = cellW;
+            work.Height = cellH;
+            // PositionX/Y = offset of media center from frame center
+            work.X = (left + cellW / 2.0) - frameW / 2.0;
+            work.Y = frameH / 2.0 - (top + cellH / 2.0);
+            SyncBoxes();
+        }
+
+        /// <summary>Snap position and size to layout grid lines without changing cell choice.</summary>
+        void SnapBoxToGrid()
+        {
+            int cols = Math.Max(1, work.GridCols);
+            int rows = Math.Max(1, work.GridRows);
+            double cellW = frameW / (double)cols;
+            double cellH = frameH / (double)rows;
+            // size
+            work.Width = Math.Max(cellW, Math.Round(work.Width / cellW) * cellW);
+            work.Height = Math.Max(cellH, Math.Round(work.Height / cellH) * cellH);
+            // center
+            double cx = frameW / 2.0 + work.X;
+            double cy = frameH / 2.0 - work.Y;
+            cx = Math.Round(cx / cellW) * cellW + (work.Width / 2.0) % cellW;
+            // better: snap top-left then recompute center
+            double left = cx - work.Width / 2.0;
+            double top = cy - work.Height / 2.0;
+            left = Math.Round(left / cellW) * cellW;
+            top = Math.Round(top / cellH) * cellH;
+            work.X = (left + work.Width / 2.0) - frameW / 2.0;
+            work.Y = frameH / 2.0 - (top + work.Height / 2.0);
+            SyncBoxes();
+        }
+
+        /// <summary>VEGAS-like workspace: center gizmo, drag-to-move, outside drag = orientation, shadow offset.</summary>
+        internal sealed class WorkspaceView : Control
+        {
+            readonly TrackMotionForm host;
+            enum DragKind { None, Move, Rotate, Scale, ShadowMove }
+            DragKind drag;
+            Point last, startMouse;
+            double startAngle, startOrient, startW, startH, startX, startY;
+            double viewZoom = 1;
+            Point viewPan = Point.Empty;
+
+            public WorkspaceView(TrackMotionForm host)
+            {
+                this.host = host;
+                DoubleBuffered = true;
+                BackColor = Theme.Input;
+                Cursor = Cursors.Cross;
+            }
+
+            Rectangle FrameRect()
+            {
+                int fw = host.frameW, fh = host.frameH;
+                Rectangle area = ClientRectangle;
+                area.Inflate(-Theme.D(16), -Theme.D(16));
+                double scale = Math.Min(area.Width / (double)fw, area.Height / (double)fh) * viewZoom;
+                int dw = (int)Math.Round(fw * scale), dh = (int)Math.Round(fh * scale);
+                int ox = area.X + (area.Width - dw) / 2 + viewPan.X;
+                int oy = area.Y + (area.Height - dh) / 2 + viewPan.Y;
+                return new Rectangle(ox, oy, Math.Max(8, dw), Math.Max(8, dh));
+            }
+
+            double ScaleFactor()
+            {
+                Rectangle f = FrameRect();
+                return f.Width / (double)host.frameW;
+            }
+
+            PointF MediaCenterScreen()
+            {
+                TrackMotionSpec w = host.work;
+                Rectangle f = FrameRect();
+                double s = ScaleFactor();
+                double cx = host.frameW / 2.0 + w.X;
+                double cy = host.frameH / 2.0 - w.Y;
+                return new PointF((float)(f.X + cx * s), (float)(f.Y + cy * s));
+            }
+
+            Rectangle MediaRect()
+            {
+                TrackMotionSpec w = host.work;
+                Rectangle f = FrameRect();
+                double s = ScaleFactor();
+                double cx = host.frameW / 2.0 + w.X;
+                double cy = host.frameH / 2.0 - w.Y;
+                double mw = Math.Max(1, w.Width), mh = Math.Max(1, w.Height);
+                return new Rectangle(
+                    f.X + (int)Math.Round((cx - mw / 2) * s),
+                    f.Y + (int)Math.Round((cy - mh / 2) * s),
+                    Math.Max(4, (int)Math.Round(mw * s)),
+                    Math.Max(4, (int)Math.Round(mh * s)));
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                g.Clear(Theme.Input);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                TrackMotionSpec w = host.work;
+                Rectangle frame = FrameRect();
+                double s = ScaleFactor();
+
+                // VEGAS-style dotted grid (points, not lines)
+                using (SolidBrush dot = new SolidBrush(Color.FromArgb(90, Theme.Dim)))
+                {
+                    double step = Math.Max(4, host.gridSpacing) * s;
+                    if (step >= 3)
+                    {
+                        for (double x = frame.Left; x <= frame.Right + 0.5; x += step)
+                            for (double y = frame.Top; y <= frame.Bottom + 0.5; y += step)
+                                g.FillRectangle(dot, (float)x, (float)y, 1.5f, 1.5f);
+                    }
+                }
+                using (Pen border = new Pen(Theme.Border)) g.DrawRectangle(border, frame);
+
+                // Layout grid N×M (cell divisions)
+                int cols = Math.Max(1, host.work.GridCols);
+                int rows = Math.Max(1, host.work.GridRows);
+                if (cols > 1 || rows > 1)
+                {
+                    using (Pen cellPen = new Pen(Color.FromArgb(70, Theme.Accent)))
+                    {
+                        for (int c = 1; c < cols; c++)
+                        {
+                            float x = frame.Left + (float)(frame.Width * (c / (double)cols));
+                            g.DrawLine(cellPen, x, frame.Top, x, frame.Bottom);
+                        }
+                        for (int r = 1; r < rows; r++)
+                        {
+                            float y = frame.Top + (float)(frame.Height * (r / (double)rows));
+                            g.DrawLine(cellPen, frame.Left, y, frame.Right, y);
+                        }
+                    }
+                }
+
+                Rectangle media = MediaRect();
+
+                // shadow rect (offset)
+                if (w.Shadow && host.mode == 1) // No UI path can enable this legacy-only mode.
+                {
+                    int shWpx = Math.Max(4, (int)Math.Round((w.ShadowWidth > 1 ? w.ShadowWidth : w.Width) * s));
+                    int shHpx = Math.Max(4, (int)Math.Round((w.ShadowHeight > 1 ? w.ShadowHeight : w.Height) * s));
+                    Rectangle sh = new Rectangle(media.Left + (media.Width - shWpx) / 2,
+                        media.Top + (media.Height - shHpx) / 2, shWpx, shHpx);
+                    sh.Offset((int)Math.Round(w.ShadowX * s), (int)Math.Round(-w.ShadowY * s));
+                    GraphicsState shadowState = g.Save();
+                    if (host.rotationOn)
+                    {
+                        PointF shadowCenter = new PointF(sh.Left + sh.Width / 2f, sh.Top + sh.Height / 2f);
+                        g.TranslateTransform(shadowCenter.X, shadowCenter.Y);
+                        g.RotateTransform((float)(-w.Angle));
+                        g.TranslateTransform(-shadowCenter.X, -shadowCenter.Y);
+                    }
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb((int)Math.Max(25, w.ShadowAlpha * 2.2), 0, 0, 0)))
+                        g.FillRectangle(b, sh);
+                    using (Pen p = new Pen(Color.FromArgb(160, Theme.Dim), 1f)) g.DrawRectangle(p, sh);
+                    g.Restore(shadowState);
+                    if (host.mode == 1)
+                    {
+                        int sgx = sh.X + sh.Width / 2, sgy = sh.Y + sh.Height / 2;
+                        using (Pen ax = new Pen(Theme.Dim, 1.2f))
+                        {
+                            g.DrawLine(ax, sgx - Theme.D(20), sgy, sgx + Theme.D(20), sgy);
+                            g.DrawLine(ax, sgx, sgy - Theme.D(20), sgx, sgy + Theme.D(20));
+                        }
+                    }
+                }
+
+                // main media (rotated for preview)
+                GraphicsState st = g.Save();
+                PointF center = MediaCenterScreen();
+                g.TranslateTransform(center.X, center.Y);
+                g.RotateTransform((float)(host.rotationOn ? -w.Angle : 0)); // screen vs Vegas orientation
+                g.TranslateTransform(-center.X, -center.Y);
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(w.Enabled ? 110 : 40, Theme.Accent)))
+                    g.FillRectangle(b, media);
+                using (Pen p = new Pen(Theme.Accent, 1.5f)) g.DrawRectangle(p, media);
+                g.Restore(st);
+
+                // Visible corner resize handles for the active editing layer.
+                Rectangle handleRect = media;
+                if (host.mode == 1)
+                {
+                    int hw = Math.Max(4, (int)Math.Round(w.ShadowWidth * s));
+                    int hh = Math.Max(4, (int)Math.Round(w.ShadowHeight * s));
+                    handleRect = new Rectangle(media.Left + (media.Width - hw) / 2,
+                        media.Top + (media.Height - hh) / 2, hw, hh);
+                    handleRect.Offset((int)Math.Round(w.ShadowX * s), (int)Math.Round(-w.ShadowY * s));
+                }
+                int hs = Theme.D(9);
+                Point[] handlePoints = {
+                    new Point(handleRect.Left, handleRect.Top),
+                    new Point(handleRect.Right, handleRect.Top),
+                    new Point(handleRect.Left, handleRect.Bottom),
+                    new Point(handleRect.Right, handleRect.Bottom)
+                };
+                using (SolidBrush hb = new SolidBrush(Theme.Input))
+                using (Pen hp = new Pen(Theme.Accent, 1.5f))
+                {
+                    foreach (Point hpnt in handlePoints)
+                    {
+                        Rectangle hr = new Rectangle(hpnt.X - hs / 2, hpnt.Y - hs / 2, hs, hs);
+                        g.FillRectangle(hb, hr);
+                        g.DrawRectangle(hp, hr);
+                    }
+                }
+
+                // orientation ring when rotating or non-zero angle
+                if (host.rotationOn && (drag == DragKind.Rotate || Math.Abs(w.Angle) > 0.05))
+                {
+                    float rad = (float)(Math.Max(media.Width, media.Height) * 0.55);
+                    using (Pen ring = new Pen(Color.FromArgb(120, Theme.Accent), 1f))
+                        g.DrawEllipse(ring, center.X - rad, center.Y - rad, rad * 2, rad * 2);
+                }
+
+                // center gizmo
+                int gx = (int)Math.Round(center.X), gy = (int)Math.Round(center.Y);
+                int arm = Theme.D(40);
+                using (Pen ax = new Pen(Theme.Text, 1.5f))
+                {
+                    g.DrawLine(ax, gx - arm, gy, gx + arm, gy);
+                    g.DrawLine(ax, gx, gy - arm, gx, gy + arm);
+                }
+                using (SolidBrush b = new SolidBrush(Theme.Accent))
+                    g.FillEllipse(b, gx - Theme.D(4), gy - Theme.D(4), Theme.D(8), Theme.D(8));
+                TextRenderer.DrawText(g, "X", Theme.Small, new Point(gx + arm + 2, gy - Theme.D(8)), Theme.Text, TextFormatFlags.NoPrefix);
+                TextRenderer.DrawText(g, "Y", Theme.Small, new Point(gx + 4, gy - arm - Theme.D(14)), Theme.Text, TextFormatFlags.NoPrefix);
+
+                string tip = host.mode == 1
+                    ? host.T("Drag shadow offset · enable 2D Shadow", "Тяните смещение тени · включите 2D Тень", "Arrastra el desplazamiento de sombra")
+                    : host.T("Drag center to move · outside = rotate · corners = scale",
+                        "Центр — двигать · снаружи — поворот · углы — масштаб",
+                        "Centro = mover · fuera = rotar · esquinas = escala");
+                TextRenderer.DrawText(g, tip, Theme.Small, new Rectangle(0, Height - Theme.D(22), Width, Theme.D(20)), Theme.Faint,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPrefix);
+            }
+
+            protected override void OnMouseDown(MouseEventArgs e)
+            {
+                if (e.Button != MouseButtons.Left) { base.OnMouseDown(e); return; }
+                TrackMotionSpec w = host.work;
+                PointF c = MediaCenterScreen();
+                Rectangle media = MediaRect();
+                double dist = Math.Sqrt((e.X - c.X) * (e.X - c.X) + (e.Y - c.Y) * (e.Y - c.Y));
+                double diag = Math.Sqrt(media.Width * media.Width + media.Height * media.Height) * 0.5;
+
+                if (host.mode == 1)
+                {
+                    int shWpx = Math.Max(4, (int)Math.Round(w.ShadowWidth * ScaleFactor()));
+                    int shHpx = Math.Max(4, (int)Math.Round(w.ShadowHeight * ScaleFactor()));
+                    Rectangle shadowHitRect = new Rectangle(media.Left + (media.Width - shWpx) / 2,
+                        media.Top + (media.Height - shHpx) / 2, shWpx, shHpx);
+                    shadowHitRect.Offset((int)Math.Round(w.ShadowX * ScaleFactor()), (int)Math.Round(-w.ShadowY * ScaleFactor()));
+                    if (NearCorner(e.Location, shadowHitRect) && !host.preventScale)
+                    {
+                        drag = DragKind.Scale;
+                        startW = w.ShadowWidth; startH = w.ShadowHeight;
+                        startX = w.X; startY = w.Y;
+                    }
+                    else
+                    {
+                        drag = DragKind.ShadowMove;
+                    }
+                }
+                else if (host.rotationOn && dist > diag * 1.05 && dist < diag * 1.8)
+                {
+                    drag = DragKind.Rotate;
+                    startAngle = Math.Atan2(e.Y - c.Y, e.X - c.X) * 180 / Math.PI;
+                    startOrient = w.Angle;
+                }
+                else if (NearCorner(e.Location, media) && !host.preventScale)
+                {
+                    drag = DragKind.Scale;
+                    startW = w.Width; startH = w.Height;
+                    startX = w.X; startY = w.Y;
+                }
+                else if (!host.preventMove)
+                {
+                    drag = DragKind.Move;
+                }
+                else drag = DragKind.None;
+
+                last = e.Location;
+                startMouse = e.Location;
+                Capture = true;
+                base.OnMouseDown(e);
+            }
+
+            bool NearCorner(Point p, Rectangle r)
+            {
+                int pad = Theme.D(14);
+                // corners
+                Point[] corners = {
+                    new Point(r.Left, r.Top), new Point(r.Right, r.Top),
+                    new Point(r.Left, r.Bottom), new Point(r.Right, r.Bottom)
+                };
+                foreach (Point c in corners)
+                    if (Math.Abs(p.X - c.X) <= pad && Math.Abs(p.Y - c.Y) <= pad) return true;
+                // edges (midpoints) — scale like VEGAS selection box
+                Point[] mids = {
+                    new Point(r.Left + r.Width / 2, r.Top),
+                    new Point(r.Left + r.Width / 2, r.Bottom),
+                    new Point(r.Left, r.Top + r.Height / 2),
+                    new Point(r.Right, r.Top + r.Height / 2)
+                };
+                foreach (Point c in mids)
+                    if (Math.Abs(p.X - c.X) <= pad && Math.Abs(p.Y - c.Y) <= pad) return true;
+                // near any border
+                bool onBorder =
+                    (p.X >= r.Left - pad && p.X <= r.Right + pad && Math.Abs(p.Y - r.Top) <= pad) ||
+                    (p.X >= r.Left - pad && p.X <= r.Right + pad && Math.Abs(p.Y - r.Bottom) <= pad) ||
+                    (p.Y >= r.Top - pad && p.Y <= r.Bottom + pad && Math.Abs(p.X - r.Left) <= pad) ||
+                    (p.Y >= r.Top - pad && p.Y <= r.Bottom + pad && Math.Abs(p.X - r.Right) <= pad);
+                return onBorder;
+            }
+
+            protected override void OnMouseUp(MouseEventArgs e)
+            {
+                drag = DragKind.None; Capture = false;
+                base.OnMouseUp(e);
+            }
+
+            protected override void OnMouseMove(MouseEventArgs e)
+            {
+                if (drag == DragKind.None)
+                {
+                    Rectangle hit = MediaRect();
+                    if (host.mode == 1)
+                    {
+                        int shWpx = Math.Max(4, (int)Math.Round(host.work.ShadowWidth * ScaleFactor()));
+                        int shHpx = Math.Max(4, (int)Math.Round(host.work.ShadowHeight * ScaleFactor()));
+                        hit = new Rectangle(hit.Left + (hit.Width - shWpx) / 2,
+                            hit.Top + (hit.Height - shHpx) / 2, shWpx, shHpx);
+                        hit.Offset((int)Math.Round(host.work.ShadowX * ScaleFactor()), (int)Math.Round(-host.work.ShadowY * ScaleFactor()));
+                    }
+                    Cursor = NearCorner(e.Location, hit) ? Cursors.SizeNWSE
+                        : (host.mode == 1 ? Cursors.SizeAll : Cursors.Cross);
+                    base.OnMouseMove(e);
+                    return;
+                }
+                TrackMotionSpec w = host.work;
+                double s = ScaleFactor();
+                if (s < 1e-6) return;
+                double dx = (e.X - last.X) / s;
+                double dy = (e.Y - last.Y) / s;
+
+                if (drag == DragKind.Move)
+                {
+                    w.X += dx;
+                    w.Y -= dy;
+                    if (host.gridMoveOn) { w.X = SnapGridX(w.X); w.Y = SnapGridY(w.Y); } else if (host.snapOn) { w.X = Snap(w.X); w.Y = Snap(w.Y); }
+                    host.xBox.Value = w.X; host.yBox.Value = w.Y;
+                }
+                else if (drag == DragKind.ShadowMove)
+                {
+                    w.ShadowX += dx;
+                    w.ShadowY -= dy;
+                    if (host.snapOn) { w.ShadowX = Snap(w.ShadowX); w.ShadowY = Snap(w.ShadowY); }
+                    w.Shadow = true;
+                    host.shadowToggle.Checked = true;
+                    host.shX.Value = w.ShadowX; host.shY.Value = w.ShadowY;
+                }
+                else if (drag == DragKind.Rotate && host.rotationOn)
+                {
+                    PointF c = MediaCenterScreen();
+                    double ang = Math.Atan2(e.Y - c.Y, e.X - c.X) * 180 / Math.PI;
+                    double delta = ang - startAngle;
+                    w.Angle = startOrient - delta;
+                    if (host.snapOn && host.rotSnap > 0)
+                        w.Angle = Math.Round(w.Angle / host.rotSnap) * host.rotSnap;
+                    host.angBox.Value = w.Angle;
+                }
+                else if (drag == DragKind.Scale)
+                {
+                    // Scale relative to start distance from center (VEGAS Scale About Center)
+                    PointF c = MediaCenterScreen();
+                    if (host.mode == 1)
+                    {
+                        c.X += (float)(w.ShadowX * s);
+                        c.Y -= (float)(w.ShadowY * s);
+                    }
+                    double dist0 = Math.Max(8, Math.Sqrt((startMouse.X - c.X) * (startMouse.X - c.X) + (startMouse.Y - c.Y) * (startMouse.Y - c.Y)));
+                    double dist1 = Math.Max(8, Math.Sqrt((e.X - c.X) * (e.X - c.X) + (e.Y - c.Y) * (e.Y - c.Y)));
+                    double k = dist1 / dist0;
+                    double nw = Math.Max(8, startW * k);
+                    double nh = Math.Max(8, startH * k);
+                    if (host.lockAspect)
+                    {
+                        double ar = startW / Math.Max(1, startH);
+                        // keep aspect from the larger relative change
+                        nh = nw / ar;
+                    }
+                    if (host.snapOn)
+                    {
+                        nw = Math.Max(8, Snap(nw));
+                        nh = host.lockAspect ? nw * (startH / Math.Max(1, startW)) : Math.Max(8, Snap(nh));
+                    }
+                    if (host.mode == 1)
+                    {
+                        w.ShadowWidth = nw; w.ShadowHeight = nh;
+                        host.shW.Value = w.ShadowWidth; host.shH.Value = w.ShadowHeight;
+                    }
+                    else
+                    {
+                        w.Width = nw; w.Height = nh;
+                        host.wBox.Value = w.Width; host.hBox.Value = w.Height;
+                    }
+                    // Scaling is centered, matching Track Motion's Scale About Center behavior.
+                }
+
+                last = e.Location;
+                Invalidate();
+                base.OnMouseMove(e);
+            }
+
+            double Snap(double v)
+            {
+                double g = Math.Max(1, host.gridSpacing);
+                return Math.Round(v / g) * g;
+            }
+
+            double SnapGridX(double v)
+            {
+                double cell = host.frameW / (double)Math.Max(1, host.work.GridCols);
+                return Math.Round(v / cell) * cell;
+            }
+            double SnapGridY(double v)
+            {
+                double cell = host.frameH / (double)Math.Max(1, host.work.GridRows);
+                return Math.Round(v / cell) * cell;
+            }
+
+            protected override void OnMouseWheel(MouseEventArgs e)
+            {
+                // workspace zoom
+                viewZoom = Math.Max(0.25, Math.Min(4.0, viewZoom * (e.Delta > 0 ? 1.1 : 0.9)));
+                Invalidate();
+                base.OnMouseWheel(e);
+            }
+        }
+
     }
 
     // =========================================================================================
@@ -2870,12 +4795,59 @@ namespace FlpToVideo
     {
         public static float S = 1f;
         // Black and white, with VEGAS's blue-grey as the only tint.
-        public static readonly Color Bg = Rgb(0x111214), Card = Rgb(0x18191C), Row = Rgb(0x202226), Border = Rgb(0x26282C),
+        public static Color Bg = Rgb(0x111214), Card = Rgb(0x18191C), Row = Rgb(0x202226), Border = Rgb(0x26282C),
             Input = Rgb(0x1E2023), InputHover = Rgb(0x272A2E), InputBorder = Rgb(0x32353A), Raised = Rgb(0x3A3E44),
             Text = Rgb(0xF1F2F4), Dim = Rgb(0xA2A7AE), Faint = Rgb(0x6B7078),
             Accent = Rgb(0x8EA3B9), AccentHover = Rgb(0xA3B5C8), AccentDown = Rgb(0x7A8FA5), AccentSoft = Rgb(0x232A32),
             Primary = Rgb(0xECEEF1), PrimaryHover = Rgb(0xFFFFFF), PrimaryDown = Rgb(0xD0D4D9),
             Danger = Rgb(0xE07A72);
+        public static string CurrentName = "Light";
+        public static void Set(string name)
+        {
+            CurrentName = String.IsNullOrEmpty(name) ? "Light" : name;
+            if (String.Equals(CurrentName, "Dark", StringComparison.OrdinalIgnoreCase))
+            {
+                Bg=Rgb(0x17191C); Card=Rgb(0x22252A); Row=Rgb(0x2C3036); Border=Rgb(0x3A3F46); Input=Rgb(0x191C20); InputHover=Rgb(0x30353C); InputBorder=Rgb(0x454B54); Raised=Rgb(0x555D67); Text=Rgb(0xF4F1E8); Dim=Rgb(0xB7B5AE); Faint=Rgb(0x858A90); Accent=Rgb(0xE5B64D); AccentHover=Rgb(0xF2C96A); AccentDown=Rgb(0xC9972F); AccentSoft=Rgb(0x40351F); Primary=Rgb(0xF1EBDD); PrimaryHover=Rgb(0xFFFFFF); PrimaryDown=Rgb(0xD8D0C0); Danger=Rgb(0xE47B70);
+            }
+            else if (String.Equals(CurrentName, "Sunset", StringComparison.OrdinalIgnoreCase))
+            {
+                Bg=Rgb(0x34232B); Card=Rgb(0x49303A); Row=Rgb(0x5A3A43); Border=Rgb(0x76505A); Input=Rgb(0x382832); InputHover=Rgb(0x64414A); InputBorder=Rgb(0x815761); Raised=Rgb(0x98636A); Text=Rgb(0xFFF0D8); Dim=Rgb(0xE5C4AD); Faint=Rgb(0xC29B91); Accent=Rgb(0xF5A64A); AccentHover=Rgb(0xFFC36C); AccentDown=Rgb(0xD98436); AccentSoft=Rgb(0x603B38); Primary=Rgb(0xFFF0D8); PrimaryHover=Rgb(0xFFFFFF); PrimaryDown=Rgb(0xE9D6BE); Danger=Rgb(0xFF8C78);
+            }
+            else if (String.Equals(CurrentName, "Sunrise", StringComparison.OrdinalIgnoreCase))
+            {
+                Bg=Rgb(0xFFF1D8); Card=Rgb(0xFFF9EA); Row=Rgb(0xF6E5C5); Border=Rgb(0xE5CFA8); Input=Rgb(0xFFFDF5); InputHover=Rgb(0xF8E9CC); InputBorder=Rgb(0xD8C39B); Raised=Rgb(0xD9BD88); Text=Rgb(0x46372B); Dim=Rgb(0x79634E); Faint=Rgb(0xA18A70); Accent=Rgb(0xD98A32); AccentHover=Rgb(0xEC9E42); AccentDown=Rgb(0xB96E22); AccentSoft=Rgb(0xF7DFC0); Primary=Rgb(0x4B3A2C); PrimaryHover=Rgb(0x34271E); PrimaryDown=Rgb(0x65513D); Danger=Rgb(0xB94D42);
+            }
+            else // Light: cream/charcoal analog-instrument palette from the reference
+            {
+                CurrentName = "Light";
+                Bg=Rgb(0xE8E5DC); Card=Rgb(0xF7F5EE); Row=Rgb(0xE7E3D8); Border=Rgb(0xC9C5BA); Input=Rgb(0xF0EEE7); InputHover=Rgb(0xE5E1D7); InputBorder=Rgb(0xB8B4A9); Raised=Rgb(0x55534D); Text=Rgb(0x292A27); Dim=Rgb(0x66665F); Faint=Rgb(0x89877E); Accent=Rgb(0xDDAA36); AccentHover=Rgb(0xEFC04C); AccentDown=Rgb(0xB98522); AccentSoft=Rgb(0xF4E5B8); Primary=Rgb(0x33332F); PrimaryHover=Rgb(0x171815); PrimaryDown=Rgb(0x4A4943); Danger=Rgb(0xB94D42);
+            }
+        }
+        public static void Recolor(Control root)
+        {
+            if (root == null) return;
+            root.BackColor = Bg; root.ForeColor = Text;
+            foreach (Control c in root.Controls)
+            {
+                if (c is Panel || c is GroupBox) c.BackColor = Card;
+                else if (c is Label) c.BackColor = Color.Transparent;
+                else c.BackColor = Input;
+                c.ForeColor = Text;
+                RecolorChildren(c);
+            }
+            root.Invalidate(true);
+        }
+        static void RecolorChildren(Control root)
+        {
+            foreach (Control c in root.Controls)
+            {
+                if (c is Panel || c is GroupBox) c.BackColor = Card;
+                else if (c is Label) c.BackColor = Color.Transparent;
+                else c.BackColor = Input;
+                c.ForeColor = Text;
+                RecolorChildren(c);
+            }
+        }
         public static Font Base, Semi, Small, Caption, Title;
         static bool ready;
 
@@ -2884,20 +4856,26 @@ namespace FlpToVideo
             if (ready) return;
             try { using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) S = Math.Max(1f, g.DpiX / 96f); }
             catch { S = 1f; }
-            Base = MakeFont("Segoe UI", 9f, false);
-            Semi = MakeFont("Segoe UI Semibold", 9f, true);
-            Small = MakeFont("Segoe UI", 8.25f, false);
-            Caption = MakeFont("Segoe UI Semibold", 7.5f, true);
-            Title = MakeFont("Segoe UI Semibold", 13f, true);
+            // Never use italic — Regular or Bold only.
+            Base = MakeFont(9f, false);
+            Semi = MakeFont(9f, true);
+            Small = MakeFont(8.25f, false);
+            Caption = MakeFont(7.5f, true);
+            Title = MakeFont(13f, true);
             ready = true;
         }
 
-        static Font MakeFont(string family, float size, bool semibold)
+        static Font MakeFont(float size, bool bold)
         {
-            Font f = new Font(family, size, FontStyle.Regular, GraphicsUnit.Point);
-            if (string.Equals(f.Name, family, StringComparison.OrdinalIgnoreCase)) return f;
-            f.Dispose(); // "Segoe UI Semibold" missing: fall back to bold
-            return new Font("Segoe UI", size, semibold ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Point);
+            // Prefer Segoe UI; always FontStyle.Regular or Bold (no italic/oblique).
+            try
+            {
+                return new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Point);
+            }
+            catch
+            {
+                return new Font(SystemFonts.MessageBoxFont.FontFamily, size, bold ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Point);
+            }
         }
 
         public static int D(double v) { return (int)Math.Round(v * S); }
@@ -3195,11 +5173,25 @@ namespace FlpToVideo
     /// <summary>Row of mutually exclusive options.</summary>
     internal sealed class Segmented : Painted
     {
-        readonly string[] items;
+        string[] items;
         int sel, hot = -1;
         public event EventHandler Changed;
 
         public Segmented(params string[] items) { this.items = items; }
+
+        public void SetItems(params string[] newItems)
+        {
+            if (newItems == null || newItems.Length == 0) return;
+            int old = sel;
+            items = newItems;
+            sel = Math.Max(0, Math.Min(items.Length - 1, old));
+            Invalidate();
+        }
+
+        public string[] GetItems()
+        {
+            return items;
+        }
 
         public int Value
         {
@@ -3216,8 +5208,22 @@ namespace FlpToVideo
 
         Rectangle Slot(int i)
         {
-            int w = Width / items.Length;
-            return new Rectangle(i * w, 0, i == items.Length - 1 ? Width - i * w : w, Height);
+            // Proportional slots by measured text so long translations are not clipped.
+            int n = items.Length;
+            if (n <= 0) return Rectangle.Empty;
+            int[] weights = new int[n];
+            int sum = 0;
+            for (int k = 0; k < n; k++)
+            {
+                weights[k] = Math.Max(Theme.D(36), TextRenderer.MeasureText(items[k] ?? "", Theme.Semi).Width + Theme.D(20));
+                sum += weights[k];
+            }
+            if (sum <= 0) sum = 1;
+            int x = 0;
+            for (int k = 0; k < i; k++)
+                x += Math.Max(1, (int)Math.Round(weights[k] * (double)Width / sum));
+            int w = (i == n - 1) ? Width - x : Math.Max(1, (int)Math.Round(weights[i] * (double)Width / sum));
+            return new Rectangle(x, 0, w, Height);
         }
 
         int SlotAt(Point p)
@@ -3277,7 +5283,7 @@ namespace FlpToVideo
                 }
                 TextRenderer.DrawText(g, items[i], i == sel ? Theme.Semi : Theme.Base, r, fg,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine |
-                    TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+                    TextFormatFlags.NoPrefix);
             }
         }
     }
@@ -4198,11 +6204,20 @@ namespace FlpToVideo
     /// <summary>Flat tabs with an underline, VEGAS-style.</summary>
     internal sealed class TabStrip : Painted
     {
-        readonly string[] items;
+        string[] items;
         int sel, hot = -1;
         public event EventHandler Changed;
 
         public TabStrip(params string[] items) { this.items = items; TabStop = false; }
+
+        public void SetItems(params string[] newItems)
+        {
+            if (newItems == null || newItems.Length == 0) return;
+            int old = sel;
+            items = newItems;
+            sel = Math.Max(0, Math.Min(items.Length - 1, old));
+            Invalidate();
+        }
 
         public int Value
         {
